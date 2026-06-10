@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>选择文件</title>
+  <script src="https://res.wx.qq.com/open/js/jweixin-1.6.0.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+      background: #F8F9FA;
+      padding: 20px;
+      min-height: 100vh;
+    }
+
+    .container {
+      max-width: 750px;
+      margin: 0 auto;
+    }
+
+    .upload-area {
+      background: #FFFFFF;
+      border-radius: 16px;
+      padding: 40px 30px;
+      text-align: center;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+      margin-bottom: 20px;
+    }
+
+    .upload-icon {
+      width: 80px;
+      height: 80px;
+      margin: 0 auto 16px;
+      background: linear-gradient(135deg, #FFD93D 0%, #FFC312 100%);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 40px;
+    }
+
+    .upload-title {
+      font-size: 20px;
+      font-weight: 600;
+      color: #2D3436;
+      margin-bottom: 8px;
+    }
+
+    .upload-desc {
+      font-size: 14px;
+      color: #636E72;
+      margin-bottom: 20px;
+    }
+
+    .file-input-wrapper {
+      position: relative;
+      display: inline-block;
+    }
+
+    input[type="file"] {
+      position: absolute;
+      opacity: 0;
+      width: 100%;
+      height: 100%;
+      cursor: pointer;
+      left: 0;
+      top: 0;
+    }
+
+    .select-btn {
+      background: linear-gradient(135deg, #FFD93D 0%, #FFC312 100%);
+      color: #2D3436;
+      border: none;
+      border-radius: 12px;
+      padding: 14px 32px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 4px 8px rgba(255, 217, 61, 0.3);
+      transition: all 0.3s;
+    }
+
+    .select-btn:active {
+      transform: scale(0.96);
+      opacity: 0.8;
+    }
+
+    .file-list {
+      background: #FFFFFF;
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+      margin-bottom: 80px;
+    }
+
+    .file-list-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: #2D3436;
+      margin-bottom: 16px;
+    }
+
+    .file-item {
+      display: flex;
+      align-items: center;
+      padding: 12px;
+      background: #F8F9FA;
+      border-radius: 12px;
+      margin-bottom: 12px;
+    }
+
+    .file-item:last-child {
+      margin-bottom: 0;
+    }
+
+    .file-icon {
+      width: 48px;
+      height: 48px;
+      background: linear-gradient(135deg, #74B9FF 0%, #A8E6FF 100%);
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      margin-right: 12px;
+      flex-shrink: 0;
+    }
+
+    .file-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .file-name {
+      font-size: 14px;
+      color: #2D3436;
+      font-weight: 500;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-bottom: 4px;
+    }
+
+    .file-size {
+      font-size: 12px;
+      color: #636E72;
+    }
+
+    .file-remove {
+      width: 36px;
+      height: 36px;
+      background: #FF6B6B;
+      border-radius: 50%;
+      border: none;
+      color: #FFFFFF;
+      font-size: 20px;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: all 0.3s;
+      line-height: 1;
+    }
+
+    .file-remove:active {
+      transform: scale(0.9);
+    }
+
+    .empty-tip {
+      text-align: center;
+      padding: 40px 0;
+      color: #636E72;
+      font-size: 14px;
+    }
+
+    .action-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: #FFFFFF;
+      padding: 12px 16px;
+      box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.06);
+      display: flex;
+      gap: 12px;
+      z-index: 100;
+    }
+
+    .action-btn {
+      flex: 1;
+      padding: 14px;
+      border-radius: 12px;
+      border: none;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+
+    .btn-clear {
+      background: #F8F9FA;
+      color: #636E72;
+    }
+
+    .btn-confirm {
+      background: linear-gradient(135deg, #00B894 0%, #55EFC4 100%);
+      color: #FFFFFF;
+      box-shadow: 0 4px 8px rgba(0, 184, 148, 0.3);
+    }
+
+    .btn-confirm:disabled {
+      background: #DFE6E9;
+      color: #B2BEC3;
+      box-shadow: none;
+      cursor: not-allowed;
+    }
+
+    .action-btn:active:not(:disabled) {
+      transform: scale(0.96);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="upload-area">
+      <div class="upload-icon">📁</div>
+      <div class="upload-title">选择本地文件</div>
+      <div class="upload-desc">支持选择手机中的任意文件</div>
+      <div class="file-input-wrapper">
+        <button class="select-btn">选择文件</button>
+        <input type="file" id="fileInput" multiple accept="*/*">
+      </div>
+    </div>
+
+    <div class="file-list">
+      <div class="file-list-title">已选文件 (<span id="fileCount">0</span>)</div>
+      <div id="fileListContainer">
+        <div class="empty-tip">暂无选择文件</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="action-bar">
+    <button class="action-btn btn-clear" onclick="clearFiles()">清空</button>
+    <button class="action-btn btn-confirm" id="confirmBtn" onclick="confirmFiles()" disabled>确认选择</button>
+  </div>
+
+  <script>
+    let selectedFiles = [];
+    // 静态页只负责把浏览器选择到的文件桥接给小程序，不读取 URL 参数、不判断业务来源、不做直传。
+    // 文件类型、数量、大小和后续上传方式统一由小程序前端校验处理，避免强缓存 HTML 和业务规则不同步。
+    const CHUNK_SIZE = 2 * 1024 * 1024;
+
+    document.getElementById('fileInput').addEventListener('change', function(e) {
+      const files = Array.from(e.target.files);
+      selectedFiles.push(...files);
+      renderFileList();
+      e.target.value = '';
+    });
+
+    function renderFileList() {
+      const container = document.getElementById('fileListContainer');
+      const countEl = document.getElementById('fileCount');
+      const confirmBtn = document.getElementById('confirmBtn');
+      countEl.textContent = selectedFiles.length;
+      confirmBtn.disabled = selectedFiles.length === 0;
+      if (selectedFiles.length === 0) {
+        container.innerHTML = '<div class="empty-tip">暂无选择文件</div>';
+        return;
+      }
+      container.innerHTML = selectedFiles.map((file, index) => `
+        <div class="file-item">
+          <div class="file-icon">${getFileIcon(file.name)}</div>
+          <div class="file-info">
+            <div class="file-name">${escapeHtml(file.name)}</div>
+            <div class="file-size">${formatFileSize(file.size)}</div>
+          </div>
+          <button class="file-remove" onclick="removeFile(${index})">×</button>
+        </div>
+      `).join('');
+    }
+
+    function removeFile(index) {
+      selectedFiles.splice(index, 1);
+      renderFileList();
+    }
+
+    function clearFiles() {
+      if (selectedFiles.length === 0) return;
+      if (confirm('确定要清空所有已选文件吗？')) {
+        selectedFiles = [];
+        renderFileList();
+      }
+    }
+
+    async function confirmFiles() {
+      if (selectedFiles.length === 0) return;
+      await confirmBridgeFiles();
+    }
+
+    async function confirmBridgeFiles() {
+      const totalFiles = selectedFiles.length;
+      let successCount = 0;
+      let failedCount = 0;
+      const failedFilesList = [];
+      const confirmBtn = document.getElementById('confirmBtn');
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = '处理中...';
+      postMiniProgramMessage({ type: 'filesStart', total: totalFiles });
+
+      for (let i = 0; i < selectedFiles.length; i++) {
+        const file = selectedFiles[i];
+        confirmBtn.textContent = `文件 ${i + 1}/${totalFiles}`;
+        try {
+          if (file.size > CHUNK_SIZE) {
+            const success = await sendFileInChunks(file, i, totalFiles);
+            if (success) { successCount++; } else { failedCount++; failedFilesList.push(file.name); }
+          } else {
+            const fileData = await readSmallFile(file);
+            if (fileData) {
+              postMiniProgramMessage({ type: 'fileData', file: fileData, index: i, total: totalFiles });
+              successCount++;
+            } else { failedCount++; failedFilesList.push(file.name); }
+          }
+          await delay(50);
+        } catch (error) {
+          console.error(`处理文件失败 [${file.name}]:`, error);
+          failedCount++;
+          failedFilesList.push(file.name);
+        }
+      }
+
+      postMiniProgramMessage({ type: 'filesEnd', successCount, failedCount, failedFiles: failedFilesList });
+      confirmBtn.textContent = '传输完成，正在返回...';
+      confirmBtn.disabled = true;
+      await delay(300);
+      navigateBackToMiniProgram(confirmBtn);
+    }
+
+    async function sendFileInChunks(file, fileIndex, totalFiles) {
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      const fileId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+      const confirmBtn = document.getElementById('confirmBtn');
+      postMiniProgramMessage({ type: 'chunkStart', fileId, fileName: file.name, fileSize: file.size, fileType: file.type, totalChunks, fileIndex, totalFiles });
+
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        const start = chunkIndex * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const chunk = file.slice(start, end);
+        const progress = Math.round(((chunkIndex + 1) / totalChunks) * 100);
+        confirmBtn.textContent = `文件 ${fileIndex + 1}/${totalFiles}: ${progress}%`;
+
+        try {
+          const chunkData = await readBlobAsBase64(chunk);
+          postMiniProgramMessage({ type: 'chunkData', fileId, chunkIndex, totalChunks, data: chunkData });
+          await delay(30);
+        } catch (error) {
+          console.error(`分片 ${chunkIndex} 失败:`, error);
+          postMiniProgramMessage({ type: 'chunkError', fileId, error: error.message });
+          return false;
+        }
+      }
+
+      postMiniProgramMessage({ type: 'chunkEnd', fileId });
+      return true;
+    }
+
+    function postMiniProgramMessage(data) {
+      wx.miniProgram.postMessage({ data });
+    }
+
+    function navigateBackToMiniProgram(confirmBtn) {
+      try {
+        wx.miniProgram.navigateBack();
+      } catch (e) {
+        console.error('自动返回失败:', e);
+        confirmBtn.textContent = '请手动点击左上角返回';
+      }
+    }
+
+    function readBlobAsBase64(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => resolve(e.target.result.split(',')[1]);
+        reader.onerror = () => reject(new Error('读取失败'));
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    function readSmallFile(file) {
+      return new Promise(resolve => {
+        const reader = new FileReader();
+        reader.onload = e => resolve({ name: file.name, size: file.size, type: file.type, data: e.target.result });
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+    function formatFileSize(size) {
+      if (size < 1024) return size + ' B';
+      if (size < 1024 * 1024) return (size / 1024).toFixed(2) + ' KB';
+      return (size / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+
+    function getFileIcon(filename) {
+      const ext = filename.split('.').pop().toLowerCase();
+      const iconMap = { 'pdf': '📄', 'doc': '📝', 'docx': '📝', 'xls': '📊', 'xlsx': '📊', 'ppt': '📽️', 'pptx': '📽️', 'txt': '📃', 'zip': '🗜️', 'rar': '🗜️', 'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️', 'mp4': '🎬', 'avi': '🎬', 'mov': '🎬', 'mp3': '🎵', 'wav': '🎵' };
+      return iconMap[ext] || '📎';
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+  </script>
+</body>
+</html>
