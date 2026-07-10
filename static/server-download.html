@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>服务器下发文件</title>
+  <script src="https://res.wx.qq.com/open/js/jweixin-1.6.0.js"></script>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      min-height: 100vh;
+      padding: 28px 20px;
+      background: #F7F8FA;
+      color: #1F2933;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+
+    .container {
+      max-width: 720px;
+      margin: 0 auto;
+    }
+
+    .panel {
+      padding: 24px;
+      border: 1px solid #E5E7EB;
+      border-radius: 8px;
+      background: #FFFFFF;
+    }
+
+    .title {
+      margin-bottom: 8px;
+      color: #111827;
+      font-size: 20px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+
+    .desc {
+      margin-bottom: 20px;
+      color: #667085;
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    .filename {
+      margin-bottom: 12px;
+      color: #111827;
+      font-size: 14px;
+      font-weight: 500;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+
+    .progress-track {
+      width: 100%;
+      height: 8px;
+      margin-bottom: 10px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #EEF2F7;
+    }
+
+    .progress-bar {
+      width: 0%;
+      height: 100%;
+      border-radius: inherit;
+      background: #16A34A;
+      transition: width 180ms ease;
+    }
+
+    .progress-text {
+      min-height: 22px;
+      color: #475467;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .error {
+      color: #B42318;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="panel">
+      <div class="title" id="title">正在准备服务器下发文件</div>
+      <div class="desc">请保持当前页面打开，完成后会自动返回小程序。</div>
+      <div class="filename" id="filename"></div>
+      <div class="progress-track">
+        <div class="progress-bar" id="progressBar"></div>
+      </div>
+      <div class="progress-text" id="progressText">初始化中...</div>
+    </section>
+  </div>
+
+  <script>
+    // 独立服务器下发文件桥页：
+    // 1. 小程序把短期下载 URL 放在 location.hash 中，避免静态托管访问日志记录 ticket。
+    // 2. 本页只负责浏览器 fetch 服务端下发地址，再按既有 WebView 文件桥协议分片 postMessage。
+    // 3. 小程序端收到失败消息后会自动回落备用下载线路；本页不要自行重试其它下载线路。
+    const CHUNK_SIZE = 1024 * 1024;
+    const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+    const state = {
+      transferId: '',
+      sequence: 0,
+      fileName: 'download.bin',
+      fileType: 'application/octet-stream',
+      expectedSize: 0
+    };
+
+    function parseHashParams() {
+      const raw = window.location.hash.replace(/^#/, '');
+      const params = {};
+      raw.split('&').filter(Boolean).forEach(part => {
+        const index = part.indexOf('=');
+        const key = index >= 0 ? part.slice(0, index) : part;
+        const value = index >= 0 ? part.slice(index + 1) : '';
+        try {
+          params[decodeURIComponent(key)] = decodeURIComponent(value);
+        } catch (error) {
+          params[key] = value;
+        }
+      });
+      return params;
+    }
+
+    function normalizePositiveInteger(value, fallback) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+    }
+
+    function updateStatus(text, progress, isError) {
+      const titleEl = document.getElementById('title');
+      const textEl = document.getElementById('progressText');
+      const barEl = document.getElementById('progressBar');
+      textEl.textContent = text;
+      textEl.className = isError ? 'progress-text error' : 'progress-text';
+      if (isError) {
+        titleEl.textContent = '下载失败';
+      }
+      if (typeof progress === 'number' && Number.isFinite(progress)) {
+        barEl.style.width = `${Math.max(0, Math.min(100, progress))}%`;
+      }
+    }
+
+    function postMiniProgramMessage(data) {
+      wx.miniProgram.postMessage({
+        data: {
+          ...data,
+          transferId: state.transferId,
+          sequence: state.sequence++,
+          sentAt: Date.now()
+        }
+      });
+    }
+
+    function navigateBackToMiniProgram() {
+      setTimeout(() => {
+        try {
+          wx.miniProgram.navigateBack();
+        } catch (error) {
+          updateStatus('请手动返回小程序继续', undefined, false);
+        }
+      }, 200);
+    }
+
+    function failAndReturn(message) {
+      const errorMessage = String(message || '服务器下发文件失败');
+      console.error('[server-download]', errorMessage);
+      updateStatus(errorMessage, undefined, true);
+      postMiniProgramMessage({
+        type: 'serverDownloadError',
+        fileName: state.fileName,
+        error: errorMessage
+      });
+      postMiniProgramMessage({
+        type: 'filesEnd',
+        total: 1,
+        totalFiles: 1,
+        successCount: 0,
+        failedCount: 1,
+        failedFiles: [state.fileName]
+      });
+      navigateBackToMiniProgram();
+    }
+
+    function readBlobAsBase64(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = event => {
+          const result = String(event.target && event.target.result || '');
+          const commaIndex = result.indexOf(',');
+          resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+        };
+        reader.onerror = () => reject(new Error('读取下载分片失败'));
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    async function sendChunk(fileId, chunkIndex, totalChunks, blob, writtenBytes, totalBytes) {
+      const chunkData = await readBlobAsBase64(blob);
+      postMiniProgramMessage({
+        type: 'chunkData',
+        fileId,
+        chunkIndex,
+        totalChunks,
+        fileIndex: 0,
+        totalFiles: 1,
+        data: chunkData
+      });
+      const progress = totalBytes > 0 ? Math.round((writtenBytes / totalBytes) * 100) : 0;
+      updateStatus(totalBytes > 0 ? `下载中 ${progress}%` : '下载中...', progress, false);
+      // WebView postMessage 大量排队时需要给 UI 和桥接层一点调度时间。
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+
+    async function sendBlobInChunks(fileId, blob, totalBytes) {
+      const totalChunks = Math.max(1, Math.ceil(blob.size / CHUNK_SIZE));
+      postMiniProgramMessage({
+        type: 'chunkStart',
+        fileId,
+        fileName: state.fileName,
+        fileSize: totalBytes || blob.size,
+        fileType: state.fileType,
+        totalChunks,
+        fileIndex: 0,
+        totalFiles: 1
+      });
+
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        const start = chunkIndex * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, blob.size);
+        await sendChunk(fileId, chunkIndex, totalChunks, blob.slice(start, end), end, totalBytes || blob.size);
+      }
+    }
+
+    function concatBytes(left, right) {
+      if (!left || left.length === 0) {
+        return right;
+      }
+      if (!right || right.length === 0) {
+        return left;
+      }
+      const merged = new Uint8Array(left.length + right.length);
+      merged.set(left, 0);
+      merged.set(right, left.length);
+      return merged;
+    }
+
+    async function sendResponseStreamInChunks(fileId, response, totalBytes) {
+      if (!response.body || typeof response.body.getReader !== 'function' || totalBytes <= 0) {
+        const blob = await response.blob();
+        await sendBlobInChunks(fileId, blob, totalBytes || blob.size);
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const totalChunks = Math.max(1, Math.ceil(totalBytes / CHUNK_SIZE));
+      let pending = new Uint8Array(0);
+      let received = 0;
+      let sent = 0;
+
+      postMiniProgramMessage({
+        type: 'chunkStart',
+        fileId,
+        fileName: state.fileName,
+        fileSize: totalBytes,
+        fileType: state.fileType,
+        totalChunks,
+        fileIndex: 0,
+        totalFiles: 1
+      });
+
+      while (true) {
+        const result = await reader.read();
+        if (result.done) {
+          break;
+        }
+        const value = result.value;
+        if (value && value.length) {
+          received += value.length;
+          pending = concatBytes(pending, value);
+          const progress = totalBytes > 0 ? Math.round((received / totalBytes) * 100) : 0;
+          updateStatus(totalBytes > 0 ? `下载中 ${progress}%` : '下载中...', progress, false);
+          while (pending.length >= CHUNK_SIZE) {
+            const chunk = pending.slice(0, CHUNK_SIZE);
+            pending = pending.slice(CHUNK_SIZE);
+            sent += chunk.length;
+            await sendChunk(fileId, Math.floor((sent - chunk.length) / CHUNK_SIZE), totalChunks, new Blob([chunk], { type: state.fileType }), sent, totalBytes);
+          }
+        }
+      }
+
+      if (pending.length > 0 || sent === 0) {
+        const chunkIndex = Math.floor(sent / CHUNK_SIZE);
+        sent += pending.length;
+        await sendChunk(fileId, chunkIndex, totalChunks, new Blob([pending], { type: state.fileType }), sent, totalBytes);
+      }
+    }
+
+    async function startDownload() {
+      const params = parseHashParams();
+      const directUrl = String(params.directUrl || '').trim();
+      state.transferId = String(params.transferId || `server_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`);
+      state.fileName = String(params.filename || 'download.bin').trim() || 'download.bin';
+      state.fileType = String(params.fileType || 'application/octet-stream');
+      state.expectedSize = normalizePositiveInteger(params.size, 0);
+      const timeoutMs = normalizePositiveInteger(params.timeoutMs, DEFAULT_TIMEOUT_MS);
+
+      document.getElementById('filename').textContent = state.fileName;
+
+      if (params.mode !== 'serverDownload') {
+        failAndReturn('下载桥参数无效');
+        return;
+      }
+      if (!/^https:\/\//i.test(directUrl)) {
+        failAndReturn('下载地址无效');
+        return;
+      }
+
+      const controller = new AbortController();
+      const timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
+      const fileId = `server_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+      try {
+        updateStatus('正在连接下载线路...', 0, false);
+        const response = await fetch(directUrl, {
+          method: 'GET',
+          credentials: 'omit',
+          cache: 'no-store',
+          redirect: 'follow',
+          signal: controller.signal
+        });
+        if (!response.ok) {
+          throw new Error(`下载响应异常: ${response.status}`);
+        }
+
+        const headerSize = Number(response.headers.get('content-length') || 0);
+        const totalBytes = state.expectedSize || (Number.isFinite(headerSize) ? headerSize : 0);
+        postMiniProgramMessage({ type: 'filesStart', total: 1, totalFiles: 1 });
+        await sendResponseStreamInChunks(fileId, response, totalBytes);
+        clearTimeout(timeoutTimer);
+        postMiniProgramMessage({ type: 'chunkEnd', fileId, fileName: state.fileName, fileIndex: 0, totalFiles: 1 });
+        postMiniProgramMessage({
+          type: 'filesEnd',
+          total: 1,
+          totalFiles: 1,
+          successCount: 1,
+          failedCount: 0,
+          failedFiles: []
+        });
+        updateStatus('传输完成，正在返回小程序...', 100, false);
+        navigateBackToMiniProgram();
+      } catch (error) {
+        clearTimeout(timeoutTimer);
+        const message = error && error.name === 'AbortError'
+          ? 'H5 下载超时'
+          : (error && error.message ? error.message : 'H5 下载失败');
+        failAndReturn(message);
+      }
+    }
+
+    startDownload();
+  </script>
+</body>
+</html>
