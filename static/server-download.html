@@ -100,9 +100,9 @@
 
   <script>
     // 独立服务器下发文件桥页：
-    // 1. 小程序把短期下载 URL 放在 location.hash 中，避免静态托管访问日志记录 ticket。
-    // 2. 本页只负责浏览器 fetch 服务端下发地址，再按既有 WebView 文件桥协议分片 postMessage。
-    // 3. 小程序端收到失败消息后会自动回落备用下载线路；本页不要自行重试其它下载线路。
+    // 1. 小程序只把短期凭据票据放在 location.hash，静态托管和 Referer 不会记录它。
+    // 2. 页面换取短期访问凭据后，在当前用户出口获取真实下载地址并立即拉取文件。
+    // 3. 文件仍按成熟 WebView 协议分片回传；任一环节失败由小程序自动回落备用线路。
     const CHUNK_SIZE = 1024 * 1024;
     const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
     const state = {
@@ -112,6 +112,13 @@
       fileType: 'application/octet-stream',
       expectedSize: 0
     };
+
+    class UnauthorizedCredentialError extends Error {
+      constructor(message) {
+        super(message || '服务器凭据已失效');
+        this.name = 'UnauthorizedCredentialError';
+      }
+    }
 
     function parseHashParams() {
       const raw = window.location.hash.replace(/^#/, '');
@@ -127,6 +134,16 @@
         }
       });
       return params;
+    }
+
+    function clearSensitiveHash() {
+      try {
+        // hash 读取后立即从地址栏和后续截图/复制链接中移除。history.replaceState
+        // 不会重新加载静态页，也不会影响当前脚本持有的内存参数。
+        history.replaceState(null, document.title, `${location.pathname}${location.search}`);
+      } catch (error) {
+        location.hash = '';
+      }
     }
 
     function normalizePositiveInteger(value, fallback) {
@@ -220,6 +237,9 @@
     }
 
     async function sendBlobInChunks(fileId, blob, totalBytes) {
+      if (totalBytes > 0 && blob.size !== totalBytes) {
+        throw new Error(`下载文件大小校验失败: 预期 ${totalBytes} 字节，实际 ${blob.size} 字节`);
+      }
       const totalChunks = Math.max(1, Math.ceil(blob.size / CHUNK_SIZE));
       postMiniProgramMessage({
         type: 'chunkStart',
@@ -282,9 +302,12 @@
           break;
         }
         const value = result.value;
-        if (value && value.length) {
-          received += value.length;
-          pending = concatBytes(pending, value);
+          if (value && value.length) {
+            received += value.length;
+            if (received > totalBytes) {
+              throw new Error(`下载文件大小校验失败: 已接收 ${received} 字节，超过预期 ${totalBytes} 字节`);
+            }
+            pending = concatBytes(pending, value);
           const progress = totalBytes > 0 ? Math.round((received / totalBytes) * 100) : 0;
           updateStatus(totalBytes > 0 ? `下载中 ${progress}%` : '下载中...', progress, false);
           while (pending.length >= CHUNK_SIZE) {
@@ -301,11 +324,123 @@
         sent += pending.length;
         await sendChunk(fileId, chunkIndex, totalChunks, new Blob([pending], { type: state.fileType }), sent, totalBytes);
       }
+      if (sent !== totalBytes) {
+        throw new Error(`下载文件大小校验失败: 预期 ${totalBytes} 字节，实际 ${sent} 字节`);
+      }
+    }
+
+    function unwrapApiData(payload, fallbackMessage) {
+      if (!payload || typeof payload !== 'object') {
+        throw new Error(fallbackMessage || '服务器响应格式无效');
+      }
+      const code = payload.code;
+      if (payload.success === false || ![undefined, null, 0, '0', 200, '200'].includes(code)) {
+        const message = payload.message || payload.msg || payload.detail || payload.error || fallbackMessage;
+        if (Number(code) === 401) {
+          throw new UnauthorizedCredentialError(String(message || '服务器凭据已失效'));
+        }
+        throw new Error(String(message || '服务器响应异常'));
+      }
+      return payload.data && typeof payload.data === 'object' ? payload.data : payload;
+    }
+
+    async function exchangeCredential(credentialUrl, credentialTicket, retryAfterUnauthorized, signal) {
+      const response = await fetch(credentialUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ticket: credentialTicket,
+          retryAfterUnauthorized: !!retryAfterUnauthorized
+        }),
+        credentials: 'omit',
+        cache: 'no-store',
+        signal
+      });
+      if (!response.ok) {
+        throw new Error(`服务器凭据响应异常: ${response.status}`);
+      }
+      const data = unwrapApiData(await response.json(), '服务器凭据响应异常');
+      const accessToken = String(data.accessToken || data.access_token || '').trim();
+      const downloadInfoUrl = String(data.downloadInfoUrl || data.download_info_url || '').trim();
+      const fileId = Number(data.fileId || data.file_id || 0);
+      if (!accessToken || !/^https:\/\//i.test(downloadInfoUrl) || !Number.isFinite(fileId) || fileId <= 0) {
+        throw new Error('服务器下发凭据信息不完整');
+      }
+      return {
+        accessToken,
+        downloadInfoUrl,
+        fileId: Math.floor(fileId),
+        filename: String(data.filename || state.fileName || 'download.bin'),
+        size: normalizePositiveInteger(data.size, state.expectedSize)
+      };
+    }
+
+    function applyCredentialMetadata(credential) {
+      // 文件名和大小以 Server 验过权限后签入票据的事实为准。hash 中的值只用于首屏展示，
+      // 不能在凭据交换成功后继续覆盖 Server 元数据。
+      state.fileName = String(credential.filename || state.fileName || 'download.bin').trim() || 'download.bin';
+      state.expectedSize = normalizePositiveInteger(credential.size, state.expectedSize);
+      document.getElementById('filename').textContent = state.fileName;
+    }
+
+    async function fetchDownloadInfo(credential, signal) {
+      let lastError = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const separator = credential.downloadInfoUrl.includes('?') ? '&' : '?';
+          const response = await fetch(
+            `${credential.downloadInfoUrl}${separator}fileId=${encodeURIComponent(credential.fileId)}`,
+            {
+              method: 'GET',
+              headers: {
+                Authorization: `Bearer ${credential.accessToken}`,
+                Platform: 'open_platform'
+              },
+              credentials: 'omit',
+              cache: 'no-store',
+              signal
+            }
+          );
+          if (response.status === 401) {
+            throw new UnauthorizedCredentialError('服务器凭据已失效');
+          }
+          if (!response.ok) {
+            const retryable = response.status === 429 || response.status >= 500;
+            if (retryable && attempt < 2) {
+              await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
+              continue;
+            }
+            throw new Error(`下载信息响应异常: ${response.status}`);
+          }
+          const data = unwrapApiData(await response.json(), '下载信息响应异常');
+          const downloadUrl = String(data.downloadUrl || data.download_url || data.url || '').trim();
+          if (!/^https:\/\//i.test(downloadUrl)) {
+            throw new Error('服务器未返回有效下载地址');
+          }
+          return {
+            downloadUrl,
+            size: normalizePositiveInteger(data.size, credential.size)
+          };
+        } catch (error) {
+          lastError = error;
+          if (error && error.name === 'UnauthorizedCredentialError') {
+            throw error;
+          }
+          if (attempt < 2 && error && error.name !== 'AbortError') {
+            await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
+            continue;
+          }
+          break;
+        }
+      }
+      throw lastError || new Error('下载信息获取失败');
     }
 
     async function startDownload() {
       const params = parseHashParams();
-      const directUrl = String(params.directUrl || '').trim();
+      clearSensitiveHash();
+      const credentialUrl = String(params.credentialUrl || '').trim();
+      const credentialTicket = String(params.credentialTicket || '').trim();
       state.transferId = String(params.transferId || `server_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`);
       state.fileName = String(params.filename || 'download.bin').trim() || 'download.bin';
       state.fileType = String(params.fileType || 'application/octet-stream');
@@ -314,12 +449,12 @@
 
       document.getElementById('filename').textContent = state.fileName;
 
-      if (params.mode !== 'serverDownload') {
+      if (params.mode !== 'serverCredentialDownload') {
         failAndReturn('下载桥参数无效');
         return;
       }
-      if (!/^https:\/\//i.test(directUrl)) {
-        failAndReturn('下载地址无效');
+      if (!/^https:\/\//i.test(credentialUrl) || !credentialTicket) {
+        failAndReturn('服务器凭据参数无效');
         return;
       }
 
@@ -328,8 +463,40 @@
       const fileId = `server_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
       try {
+        updateStatus('正在获取服务器下发凭据...', 0, false);
+        let credential = await exchangeCredential(
+          credentialUrl,
+          credentialTicket,
+          false,
+          controller.signal
+        );
+        applyCredentialMetadata(credential);
+        let downloadInfo;
+        try {
+          downloadInfo = await fetchDownloadInfo(credential, controller.signal);
+        } catch (error) {
+          if (!error || error.name !== 'UnauthorizedCredentialError') {
+            throw error;
+          }
+          // Server 可能刚在其它节点完成凭据轮换。只允许重新交换一次，并要求凭据
+          // endpoint 打穿自己的 AT diskcache；第二次仍失败就交给小程序走备用线路。
+          credential = await exchangeCredential(
+            credentialUrl,
+            credentialTicket,
+            true,
+            controller.signal
+          );
+          applyCredentialMetadata(credential);
+          downloadInfo = await fetchDownloadInfo(credential, controller.signal);
+        }
+
+        // download_info 完成后不再需要 AT。主动断开引用只能降低普通内存驻留时间，
+        // 无法阻止用户通过调试代理查看自己设备上的网络请求，这是本方案已知边界。
+        credential.accessToken = '';
+        credential = null;
+
         updateStatus('正在连接下载线路...', 0, false);
-        const response = await fetch(directUrl, {
+        const response = await fetch(downloadInfo.downloadUrl, {
           method: 'GET',
           credentials: 'omit',
           cache: 'no-store',
@@ -341,7 +508,9 @@
         }
 
         const headerSize = Number(response.headers.get('content-length') || 0);
-        const totalBytes = state.expectedSize || (Number.isFinite(headerSize) ? headerSize : 0);
+        const totalBytes = downloadInfo.size
+          || state.expectedSize
+          || (Number.isFinite(headerSize) ? headerSize : 0);
         postMiniProgramMessage({ type: 'filesStart', total: 1, totalFiles: 1 });
         await sendResponseStreamInChunks(fileId, response, totalBytes);
         clearTimeout(timeoutTimer);
