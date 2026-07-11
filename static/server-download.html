@@ -110,13 +110,25 @@
       sequence: 0,
       fileName: 'download.bin',
       fileType: 'application/octet-stream',
-      expectedSize: 0
+      expectedSize: 0,
+      downloadSlotLeaseId: '',
+      downloadSlotReleaseUrl: ''
     };
 
     class UnauthorizedCredentialError extends Error {
       constructor(message) {
         super(message || '服务器凭据已失效');
         this.name = 'UnauthorizedCredentialError';
+      }
+    }
+
+    class DownloadSlotBusyError extends Error {
+      constructor(message, active, limit, retryAfterSeconds) {
+        super(message || '当前下载人数较多，正在等待空闲通道');
+        this.name = 'DownloadSlotBusyError';
+        this.active = normalizePositiveInteger(active, 0);
+        this.limit = normalizePositiveInteger(limit, 5);
+        this.retryAfterSeconds = normalizePositiveInteger(retryAfterSeconds, 2);
       }
     }
 
@@ -149,6 +161,31 @@
     function normalizePositiveInteger(value, fallback) {
       const parsed = Number(value);
       return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+    }
+
+    function waitWithSignal(delayMs, signal) {
+      return new Promise((resolve, reject) => {
+        if (signal && signal.aborted) {
+          reject(new DOMException('Aborted', 'AbortError'));
+          return;
+        }
+        const onAbort = () => {
+          clearTimeout(timer);
+          if (signal) {
+            signal.removeEventListener('abort', onAbort);
+          }
+          reject(new DOMException('Aborted', 'AbortError'));
+        };
+        const timer = setTimeout(() => {
+          if (signal) {
+            signal.removeEventListener('abort', onAbort);
+          }
+          resolve();
+        }, delayMs);
+        if (signal) {
+          signal.addEventListener('abort', onAbort, { once: true });
+        }
+      });
     }
 
     function updateStatus(text, progress, isError) {
@@ -356,14 +393,30 @@
         cache: 'no-store',
         signal
       });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        payload = null;
+      }
+      if (response.status === 429) {
+        const detail = payload && typeof payload.detail === 'object' ? payload.detail : {};
+        throw new DownloadSlotBusyError(
+          detail.message,
+          detail.active,
+          detail.limit,
+          detail.retryAfterSeconds || response.headers.get('retry-after')
+        );
+      }
       if (!response.ok) {
         throw new Error(`服务器凭据响应异常: ${response.status}`);
       }
-      const data = unwrapApiData(await response.json(), '服务器凭据响应异常');
+      const data = unwrapApiData(payload, '服务器凭据响应异常');
       const accessToken = String(data.accessToken || data.access_token || '').trim();
       const downloadInfoUrl = String(data.downloadInfoUrl || data.download_info_url || '').trim();
       const fileId = Number(data.fileId || data.file_id || 0);
-      if (!accessToken || !/^https:\/\//i.test(downloadInfoUrl) || !Number.isFinite(fileId) || fileId <= 0) {
+      const downloadSlotLeaseId = String(data.downloadSlotLeaseId || '').trim();
+      if (!accessToken || !/^https:\/\//i.test(downloadInfoUrl) || !Number.isFinite(fileId) || fileId <= 0 || !downloadSlotLeaseId) {
         throw new Error('服务器下发凭据信息不完整');
       }
       return {
@@ -371,8 +424,38 @@
         downloadInfoUrl,
         fileId: Math.floor(fileId),
         filename: String(data.filename || state.fileName || 'download.bin'),
-        size: normalizePositiveInteger(data.size, state.expectedSize)
+        size: normalizePositiveInteger(data.size, state.expectedSize),
+        downloadSlotLeaseId,
+        downloadSlotReleaseUrl: new URL(
+          '/api/cloud-download/pan123-h5-download-slot/release',
+          credentialUrl
+        ).toString()
       };
+    }
+
+    async function exchangeCredentialWhenSlotAvailable(
+      credentialUrl,
+      credentialTicket,
+      retryAfterUnauthorized,
+      signal
+    ) {
+      while (true) {
+        try {
+          return await exchangeCredential(
+            credentialUrl,
+            credentialTicket,
+            retryAfterUnauthorized,
+            signal
+          );
+        } catch (error) {
+          if (!error || error.name !== 'DownloadSlotBusyError') {
+            throw error;
+          }
+          const capacity = error.active > 0 ? `（${error.active}/${error.limit}）` : '';
+          updateStatus(`当前下载人数较多，正在等待空闲通道${capacity}...`, 0, false);
+          await waitWithSignal(error.retryAfterSeconds * 1000, signal);
+        }
+      }
     }
 
     function applyCredentialMetadata(credential) {
@@ -380,7 +463,41 @@
       // 不能在凭据交换成功后继续覆盖 Server 元数据。
       state.fileName = String(credential.filename || state.fileName || 'download.bin').trim() || 'download.bin';
       state.expectedSize = normalizePositiveInteger(credential.size, state.expectedSize);
+      state.downloadSlotLeaseId = credential.downloadSlotLeaseId;
+      state.downloadSlotReleaseUrl = credential.downloadSlotReleaseUrl;
       document.getElementById('filename').textContent = state.fileName;
+    }
+
+    async function releaseDownloadSlot(options) {
+      const leaseId = state.downloadSlotLeaseId;
+      const releaseUrl = state.downloadSlotReleaseUrl;
+      if (!leaseId || !/^https:\/\//i.test(releaseUrl)) {
+        return;
+      }
+
+      // Clear ownership before sending so normal completion and pagehide cannot
+      // release the same lease twice. The Server endpoint is also idempotent.
+      state.downloadSlotLeaseId = '';
+      state.downloadSlotReleaseUrl = '';
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      try {
+        await fetch(releaseUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ leaseId }),
+          credentials: 'omit',
+          cache: 'no-store',
+          keepalive: !!(options && options.keepalive),
+          signal: controller.signal
+        });
+      } catch (error) {
+        // A bounded lease is the recovery path for closed pages and transient
+        // network errors. Release failure must not invalidate a completed file.
+        console.warn('[server-download] 释放下载通道失败，将等待服务器自动回收');
+      } finally {
+        clearTimeout(timeout);
+      }
     }
 
     async function fetchDownloadInfo(credential, signal) {
@@ -459,18 +576,23 @@
       }
 
       const controller = new AbortController();
-      const timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
+      let timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
       const fileId = `server_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
       try {
         updateStatus('正在获取服务器下发凭据...', 0, false);
-        let credential = await exchangeCredential(
+        let credential = await exchangeCredentialWhenSlotAvailable(
           credentialUrl,
           credentialTicket,
           false,
           controller.signal
         );
         applyCredentialMetadata(credential);
+        // Waiting for one of the five shared slots must not consume the actual
+        // file-transfer budget. Once a slot is acquired, restart the same timeout
+        // so a queued large file still receives a full download window.
+        clearTimeout(timeoutTimer);
+        timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
         let downloadInfo;
         try {
           downloadInfo = await fetchDownloadInfo(credential, controller.signal);
@@ -480,7 +602,7 @@
           }
           // Server 可能刚在其它节点完成凭据轮换。只允许重新交换一次，并要求凭据
           // endpoint 打穿自己的 AT diskcache；第二次仍失败就交给小程序走备用线路。
-          credential = await exchangeCredential(
+          credential = await exchangeCredentialWhenSlotAvailable(
             credentialUrl,
             credentialTicket,
             true,
@@ -513,6 +635,7 @@
           || (Number.isFinite(headerSize) ? headerSize : 0);
         postMiniProgramMessage({ type: 'filesStart', total: 1, totalFiles: 1 });
         await sendResponseStreamInChunks(fileId, response, totalBytes);
+        await releaseDownloadSlot();
         clearTimeout(timeoutTimer);
         postMiniProgramMessage({ type: 'chunkEnd', fileId, fileName: state.fileName, fileIndex: 0, totalFiles: 1 });
         postMiniProgramMessage({
@@ -527,12 +650,17 @@
         navigateBackToMiniProgram();
       } catch (error) {
         clearTimeout(timeoutTimer);
+        await releaseDownloadSlot();
         const message = error && error.name === 'AbortError'
           ? 'H5 下载超时'
           : (error && error.message ? error.message : 'H5 下载失败');
         failAndReturn(message);
       }
     }
+
+    window.addEventListener('pagehide', () => {
+      void releaseDownloadSlot({ keepalive: true });
+    });
 
     startDownload();
   </script>

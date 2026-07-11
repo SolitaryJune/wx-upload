@@ -1,11 +1,11 @@
-# wx-upload.gushao.bond
+# wxview.upload.beautify.mp.juneover24.cn
 
 Static GitHub Pages host for the WeChat Mini Program WebView file picker.
 
 Production entry:
 
 ```text
-https://wx-upload.gushao.bond/static/upload.html
+https://wxview.upload.beautify.mp.juneover24.cn/static/upload.html
 ```
 
 The page only bridges selected browser files back to the Mini Program through
