@@ -49,6 +49,9 @@
     const ARCHIVE_EXTENSIONS = new Set(['zip','bdi','bds','it','dibao','sou','skini','cus']);
     const AUDIO_EXTENSIONS = new Set(['mp3','wav','ogg','m4a','aac','flac','aiff','aif','mp4']);
     const SYSTEM_NAMES = new Set(['.ds_store','thumbs.db','desktop.ini']);
+    const HTTP_522_STATUS = 522;
+    const HTTP_522_RETRY_BASE_DELAY_MS = 800;
+    const HTTP_522_RETRY_MAX_DELAY_MS = 8000;
     const state = { mode:'select', files:[], sessionToken:'', apiBase:'', running:false };
 
     const fileInput = document.getElementById('fileInput');
@@ -78,6 +81,40 @@
       if (value < 1024) return `${value} B`;
       if (value < 1024*1024) return `${(value/1024).toFixed(2)} KB`;
       return `${(value/1024/1024).toFixed(2)} MB`;
+    }
+
+    function wait(delayMs) {
+      return new Promise(resolve => setTimeout(resolve,delayMs));
+    }
+
+    function retry522Delay(retryCount) {
+      return Math.min(
+        HTTP_522_RETRY_BASE_DELAY_MS * Math.pow(2,Math.min(Math.max(retryCount-1,0),4)),
+        HTTP_522_RETRY_MAX_DELAY_MS
+      );
+    }
+
+    function retry522Text(label,retryCount,delayMs) {
+      const seconds=Math.max(1,Math.ceil(delayMs/1000));
+      return `${label}连接超时，${seconds} 秒后重试（第 ${retryCount} 次）`;
+    }
+
+    /**
+     * H5 数据面与小程序保持同一条 522 规则：只要 CDN 仍返回 522，就使用完全相同的
+     * 请求参数持续重试；收到任意非 522 响应后立即交还业务逻辑处理。网络异常、4xx、
+     * 其它 5xx 都不是 522，不在这里吞掉，避免把真实错误伪装成无限等待。
+     */
+    async function fetchUntilNon522(url,options,onRetry) {
+      let retryCount=0;
+      while(true) {
+        const response=await fetch(url,options);
+        if(response.status!==HTTP_522_STATUS) return response;
+        retryCount++;
+        const delayMs=retry522Delay(retryCount);
+        try { await response.body?.cancel?.(); } catch (_) {}
+        onRetry?.(retryCount,delayMs);
+        await wait(delayMs);
+      }
     }
 
     function extension(name) {
@@ -326,13 +363,17 @@
       } catch (_) { return blob; }
     }
 
-    async function repairAudio(blob,relativeName,bridgeId) {
+    async function repairAudio(blob,relativeName,bridgeId,onProgress) {
       const body = new FormData();
       body.append('sessionToken',state.sessionToken);
       body.append('bridgeId',bridgeId);
       body.append('originalFilename',relativeName);
       body.append('file',blob,relativeName.split('/').pop() || 'audio.bin');
-      const response = await fetch(`${state.apiBase}/api/file-manage/direct-upload/repair-audio`,{method:'POST',body,cache:'no-store',credentials:'omit'});
+      const response = await fetchUntilNon522(
+        `${state.apiBase}/api/file-manage/direct-upload/repair-audio`,
+        {method:'POST',body,cache:'no-store',credentials:'omit'},
+        (count,delay)=>onProgress?.(retry522Text('音效修复服务',count,delay))
+      );
       if (!response.ok) throw new Error(`音效修复失败(${response.status})`);
       const payload = await response.json();
       const data = payload.data || payload;
@@ -341,7 +382,11 @@
       const downloadUrl = String(data.download_url || data.url || '').trim();
       if (!repaired || !downloadUrl) return {blob,repaired:false};
       const absoluteUrl = new URL(downloadUrl,state.apiBase).toString();
-      const repairedResponse = await fetch(absoluteUrl,{cache:'no-store',credentials:'omit'});
+      const repairedResponse = await fetchUntilNon522(
+        absoluteUrl,
+        {cache:'no-store',credentials:'omit'},
+        (count,delay)=>onProgress?.(retry522Text('修复文件下载',count,delay))
+      );
       if (!repairedResponse.ok) throw new Error(`修复音效下载失败(${repairedResponse.status})`);
       return {blob:await repairedResponse.blob(),repaired:true};
     }
@@ -382,7 +427,7 @@
         }
         if (AUDIO_EXTENSIONS.has(ext)) {
           const original = await entry.async('blob');
-          const repair = await repairAudio(original,entry.name,plan.bridgeId);
+          const repair = await repairAudio(original,entry.name,plan.bridgeId,onProgress);
           if (repair.repaired) { zip.file(entry.name,repair.blob,{binary:true}); repaired++; changed=true; }
         } else if (depth<2 && ARCHIVE_EXTENSIONS.has(ext)) {
           const original=await entry.async('blob');
@@ -413,8 +458,12 @@
       return spark.end();
     }
 
-    async function apiPost(path,data) {
-      const response = await fetch(`${state.apiBase}${path}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),cache:'no-store',credentials:'omit'});
+    async function apiPost(path,data,onRetry) {
+      const response = await fetchUntilNon522(
+        `${state.apiBase}${path}`,
+        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),cache:'no-store',credentials:'omit'},
+        onRetry
+      );
       const payload = await response.json().catch(()=>({}));
       if (!response.ok || payload.success === false) throw new Error(payload.detail || payload.message || `接口响应异常(${response.status})`);
       return payload.data || payload;
@@ -422,32 +471,43 @@
 
     function uploadOfficial(blob,params,onProgress) {
       return new Promise((resolve,reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST',params.uploadUrl,true);
-        xhr.setRequestHeader('Authorization',`Bearer ${params.accessToken}`);
-        xhr.setRequestHeader('Platform','open_platform');
-        xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(`正在上传 ${Math.round(event.loaded/event.total*100)}%`,Math.round(event.loaded/event.total*100)); };
-        xhr.onerror = () => reject(new Error('云端上传网络异常'));
-        xhr.ontimeout = () => reject(new Error('云端上传超时'));
-        xhr.onload = () => {
-          let payload={}; try { payload=JSON.parse(xhr.responseText || '{}'); } catch (_) {}
-          if (xhr.status<200 || xhr.status>=300 || ![undefined,null,0,'0',200,'200'].includes(payload.code)) {
-            reject(new Error(payload.message || payload.msg || `云端上传失败(${xhr.status})`)); return;
-          }
-          const data = payload.data || payload;
-          const fileId = Number(data.fileID || data.fileId || data.file_id || 0);
-          if (!Number.isFinite(fileId) || fileId<=0) { reject(new Error('云端上传响应缺少文件编号')); return; }
-          resolve(Math.floor(fileId));
+        let retryCount=0;
+        const startAttempt=()=>{
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST',params.uploadUrl,true);
+          xhr.setRequestHeader('Authorization',`Bearer ${params.accessToken}`);
+          xhr.setRequestHeader('Platform','open_platform');
+          xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(`正在上传 ${Math.round(event.loaded/event.total*100)}%`,Math.round(event.loaded/event.total*100)); };
+          xhr.onerror = () => reject(new Error('云端上传网络异常'));
+          xhr.ontimeout = () => reject(new Error('云端上传超时'));
+          xhr.onload = () => {
+            if(xhr.status===HTTP_522_STATUS) {
+              retryCount++;
+              const delayMs=retry522Delay(retryCount);
+              onProgress(retry522Text('云端上传节点',retryCount,delayMs),0);
+              setTimeout(startAttempt,delayMs);
+              return;
+            }
+            let payload={}; try { payload=JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+            if (xhr.status<200 || xhr.status>=300 || ![undefined,null,0,'0',200,'200'].includes(payload.code)) {
+              reject(new Error(payload.message || payload.msg || `云端上传失败(${xhr.status})`)); return;
+            }
+            const data = payload.data || payload;
+            const fileId = Number(data.fileID || data.fileId || data.file_id || 0);
+            if (!Number.isFinite(fileId) || fileId<=0) { reject(new Error('云端上传响应缺少文件编号')); return; }
+            resolve(Math.floor(fileId));
+          };
+          const form = new FormData();
+          form.append('parentFileID',String(params.parentFileID));
+          form.append('filename',params.filename);
+          form.append('etag',params.etag);
+          form.append('size',String(params.size));
+          form.append('duplicate',String(params.duplicate || 2));
+          form.append('file',blob,params.filename);
+          xhr.timeout = Math.min(Math.max(120000,Math.ceil(blob.size/1024/1024)*10000),30*60*1000);
+          xhr.send(form);
         };
-        const form = new FormData();
-        form.append('parentFileID',String(params.parentFileID));
-        form.append('filename',params.filename);
-        form.append('etag',params.etag);
-        form.append('size',String(params.size));
-        form.append('duplicate',String(params.duplicate || 2));
-        form.append('file',blob,params.filename);
-        xhr.timeout = Math.min(Math.max(120000,Math.ceil(blob.size/1024/1024)*10000),30*60*1000);
-        xhr.send(form);
+        startAttempt();
       });
     }
 
@@ -474,7 +534,11 @@
       if (!stored || !(stored.blob instanceof Blob)) throw new Error('本地暂存文件已失效，请重新选择');
       const processed=await processArchive(stored,plan,text=>updateFileProgress(plan.bridgeId,text,5));
       const md5=await md5Blob(processed,text=>updateFileProgress(plan.bridgeId,text,10));
-      const params=await apiPost('/api/file-manage/direct-upload/prepare',{sessionToken:state.sessionToken,bridgeId:plan.bridgeId,fileSize:processed.size,fileMd5:md5});
+      const params=await apiPost(
+        '/api/file-manage/direct-upload/prepare',
+        {sessionToken:state.sessionToken,bridgeId:plan.bridgeId,fileSize:processed.size,fileMd5:md5},
+        (count,delay)=>updateFileProgress(plan.bridgeId,retry522Text('上传准备服务',count,delay),10)
+      );
       // AT 只在当前函数局部变量中使用；上传请求完成后立即清空引用。用户仍可通过
       // 自己设备的网络调试工具看到请求头，这是当前“服务账号 AT 直发 H5”方案的既知边界。
       let fileId=0;
@@ -484,7 +548,11 @@
         // 无论上传成功还是网络异常，都尽快释放当前 AT 字符串引用。
         params.accessToken='';
       }
-      const result=await apiPost('/api/file-manage/direct-upload/complete',{sessionToken:state.sessionToken,bridgeId:plan.bridgeId,pan123FileId:fileId});
+      const result=await apiPost(
+        '/api/file-manage/direct-upload/complete',
+        {sessionToken:state.sessionToken,bridgeId:plan.bridgeId,pan123FileId:fileId},
+        (count,delay)=>updateFileProgress(plan.bridgeId,retry522Text('上传入库服务',count,delay),95)
+      );
       updateFileProgress(plan.bridgeId,'上传完成',100);
       await deleteStoredFile(plan.bridgeId);
       return result;
@@ -499,7 +567,11 @@
     async function startUploadMode() {
       picker.classList.add('hidden'); actions.classList.add('hidden');
       intro.textContent='正在处理并上传文件，请保持页面开启。'; setStatus('正在读取上传计划...');
-      const manifest=await apiPost('/api/file-manage/direct-upload/status',{sessionToken:state.sessionToken});
+      const manifest=await apiPost(
+        '/api/file-manage/direct-upload/status',
+        {sessionToken:state.sessionToken},
+        (count,delay)=>setStatus(retry522Text('上传会话服务',count,delay))
+      );
       const completed=(manifest.files || [])
         .filter(item=>item.status==='completed' && item.result)
         .map(item=>({success:true,result:item.result}));
