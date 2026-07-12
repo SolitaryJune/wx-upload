@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <meta name="referrer" content="no-referrer">
+  <title>文件上传</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#f5f7f8;color:#172126;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .page{min-height:100vh;padding:24px 18px 36px}.panel{max-width:680px;margin:0 auto;background:#fff;border:1px solid #e4e9eb;border-radius:8px;padding:22px}
+    h1{font-size:22px;margin:0 0 8px;letter-spacing:0}.hint{font-size:14px;line-height:1.7;color:#647178;margin:0 0 22px}
+    .picker{display:flex;align-items:center;justify-content:center;min-height:126px;border:1px dashed #9eabad;background:#fafcfc;cursor:pointer}
+    .picker strong{display:block;text-align:center;font-size:17px}.picker span{display:block;margin-top:8px;color:#748187;font-size:13px}
+    input{display:none}.list{margin-top:18px}.file{padding:12px 0;border-bottom:1px solid #edf0f1}.file:last-child{border-bottom:0}
+    .name{font-size:14px;word-break:break-all}.meta{font-size:12px;color:#7c898f;margin-top:5px}.bar{height:6px;background:#e7ecee;margin-top:9px;overflow:hidden}
+    .bar i{display:block;height:100%;width:0;background:#00866a;transition:width .2s}.actions{display:flex;gap:10px;margin-top:20px}
+    button{height:44px;border:0;border-radius:6px;padding:0 18px;font-size:15px;cursor:pointer}.primary{flex:1;background:#00866a;color:#fff}.secondary{background:#e9eeee;color:#324046}
+    button:disabled{opacity:.48;cursor:not-allowed}.status{margin-top:18px;padding:12px;background:#f0f6f4;color:#31584d;font-size:14px;line-height:1.6;white-space:pre-wrap}
+    .error{background:#fff0f0;color:#a12d2d}.hidden{display:none}
+  </style>
+  <script src="./vendor/jszip.min.js"></script>
+  <script src="./vendor/spark-md5.min.js"></script>
+  <script src="./vendor/gifuct-js.min.js"></script>
+  <script src="./vendor/gifenc.min.js"></script>
+  <script src="https://res.wx.qq.com/open/js/jweixin-1.6.0.js"></script>
+</head>
+<body>
+  <main class="page"><section class="panel">
+    <h1>文件上传</h1>
+    <p id="intro" class="hint">选择需要上传的文件。文件只保存在当前设备，确认后返回小程序整理。</p>
+    <label id="picker" class="picker"><input id="fileInput" type="file" multiple><div><strong>选择本地文件</strong><span>支持多选，处理过程中请保持页面开启</span></div></label>
+    <div id="fileList" class="list"></div>
+    <div id="actions" class="actions"><button id="clearButton" class="secondary" disabled>清空</button><button id="confirmButton" class="primary" disabled>返回小程序整理</button></div>
+    <div id="status" class="status hidden"></div>
+  </section></main>
+
+  <script>
+  (() => {
+    'use strict';
+
+    // 本页使用两个阶段：select 把 File/Blob 留在同源 IndexedDB，仅把元数据返回小程序；
+    // upload 再按 bridgeId 取回 Blob、执行归档处理并直接调用官方动态上传域名。
+    const DB_NAME = 'juneover24-manage-direct-upload';
+    const DB_VERSION = 1;
+    const STORE_NAME = 'files';
+    const FILE_TTL_MS = 24 * 60 * 60 * 1000;
+    const MAX_FILES = 100;
+    const MAX_CONCURRENCY = 5;
+    const ARCHIVE_EXTENSIONS = new Set(['zip','bdi','bds','it','dibao','sou','skini','cus']);
+    const AUDIO_EXTENSIONS = new Set(['mp3','wav','ogg','m4a','aac','flac','aiff','aif','mp4']);
+    const SYSTEM_NAMES = new Set(['.ds_store','thumbs.db','desktop.ini']);
+    const state = { mode:'select', files:[], sessionToken:'', apiBase:'', running:false };
+
+    const fileInput = document.getElementById('fileInput');
+    const picker = document.getElementById('picker');
+    const fileList = document.getElementById('fileList');
+    const clearButton = document.getElementById('clearButton');
+    const confirmButton = document.getElementById('confirmButton');
+    const actions = document.getElementById('actions');
+    const statusBox = document.getElementById('status');
+    const intro = document.getElementById('intro');
+
+    function parseHash() {
+      const params = new URLSearchParams(location.hash.replace(/^#/,''));
+      const result = {};
+      params.forEach((value,key) => { result[key] = value; });
+      history.replaceState(null,document.title,location.pathname + location.search);
+      return result;
+    }
+
+    function setStatus(text,error=false) {
+      statusBox.textContent = text;
+      statusBox.className = error ? 'status error' : 'status';
+    }
+
+    function formatBytes(size) {
+      const value = Number(size || 0);
+      if (value < 1024) return `${value} B`;
+      if (value < 1024*1024) return `${(value/1024).toFixed(2)} KB`;
+      return `${(value/1024/1024).toFixed(2)} MB`;
+    }
+
+    function extension(name) {
+      const clean = String(name || '').split('/').pop() || '';
+      const index = clean.lastIndexOf('.');
+      return index >= 0 ? clean.slice(index+1).toLowerCase() : '';
+    }
+
+    function createBridgeId() {
+      return `manage_${Date.now()}_${crypto.getRandomValues(new Uint32Array(2)).join('_')}`;
+    }
+
+    function postMessage(data) {
+      wx.miniProgram.postMessage({ data: { ...data, sentAt:Date.now() } });
+    }
+
+    function navigateBack() {
+      setTimeout(() => wx.miniProgram.navigateBack({ delta:1 }),120);
+    }
+
+    function openDb() {
+      return new Promise((resolve,reject) => {
+        const request = indexedDB.open(DB_NAME,DB_VERSION);
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME,{keyPath:'bridgeId'});
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('本地文件存储不可用'));
+      });
+    }
+
+    async function withStore(mode,worker) {
+      const db = await openDb();
+      try {
+        return await new Promise((resolve,reject) => {
+          const tx = db.transaction(STORE_NAME,mode);
+          const store = tx.objectStore(STORE_NAME);
+          let result;
+          try { result = worker(store); } catch (error) { reject(error); return; }
+          tx.oncomplete = () => resolve(result);
+          tx.onerror = () => reject(tx.error || new Error('本地文件存储失败'));
+          tx.onabort = () => reject(tx.error || new Error('本地文件存储已取消'));
+        });
+      } finally { db.close(); }
+    }
+
+    function requestResult(request) {
+      return new Promise((resolve,reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('本地文件读取失败'));
+      });
+    }
+
+    async function putStoredFile(record) {
+      const db = await openDb();
+      try {
+        const tx = db.transaction(STORE_NAME,'readwrite');
+        tx.objectStore(STORE_NAME).put(record);
+        await new Promise((resolve,reject) => { tx.oncomplete=resolve; tx.onerror=()=>reject(tx.error); tx.onabort=()=>reject(tx.error); });
+      } finally { db.close(); }
+    }
+
+    async function getStoredFile(bridgeId) {
+      const db = await openDb();
+      try {
+        return await requestResult(db.transaction(STORE_NAME,'readonly').objectStore(STORE_NAME).get(bridgeId));
+      } finally { db.close(); }
+    }
+
+    async function deleteStoredFile(bridgeId) {
+      await withStore('readwrite',store => store.delete(bridgeId));
+    }
+
+    async function cleanupExpiredFiles() {
+      const db = await openDb();
+      try {
+        const tx = db.transaction(STORE_NAME,'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        const request = store.openCursor();
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (!cursor) return;
+          if (Date.now() - Number(cursor.value.createdAt || 0) > FILE_TTL_MS) cursor.delete();
+          cursor.continue();
+        };
+        await new Promise((resolve,reject)=>{tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);});
+      } finally { db.close(); }
+    }
+
+    function renderSelection() {
+      fileList.innerHTML = '';
+      state.files.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'file';
+        row.innerHTML = `<div class="name"></div><div class="meta"></div>`;
+        row.querySelector('.name').textContent = item.name;
+        row.querySelector('.meta').textContent = formatBytes(item.size);
+        fileList.appendChild(row);
+      });
+      clearButton.disabled = state.files.length === 0;
+      confirmButton.disabled = state.files.length === 0;
+    }
+
+    async function selectFiles(fileListValue) {
+      const selected = Array.from(fileListValue || []).slice(0,MAX_FILES);
+      // 用户重新选择时删除本页上一批尚未提交的 Blob，避免只能等待 24 小时 TTL 清理。
+      for (const item of state.files) await deleteStoredFile(item.bridgeId);
+      state.files = [];
+      setStatus(`正在保存 ${selected.length} 个文件到当前设备...`);
+      for (let index=0; index<selected.length; index++) {
+        const file = selected[index];
+        const bridgeId = createBridgeId();
+        await putStoredFile({ bridgeId, blob:file, name:file.name, size:file.size, type:file.type, createdAt:Date.now() });
+        state.files.push({ bridgeId, name:file.name, size:file.size, type:file.type || 'application/octet-stream' });
+        setStatus(`正在保存文件 ${index+1}/${selected.length}`);
+      }
+      statusBox.className = 'status hidden';
+      renderSelection();
+    }
+
+    async function confirmSelection() {
+      if (!state.files.length || state.running) return;
+      state.running = true;
+      confirmButton.disabled = true;
+      postMessage({ type:'manageDirectSelection', files:state.files, totalCount:state.files.length, complete:true });
+      setStatus('文件已保存，正在返回小程序整理...');
+      navigateBack();
+    }
+
+    function isSystemEntry(path) {
+      const parts = String(path || '').replace(/\\/g,'/').split('/').filter(Boolean);
+      if (parts.some(part => part.toLowerCase() === '__macosx')) return true;
+      return parts.length > 0 && (parts[parts.length-1].startsWith('._') || SYSTEM_NAMES.has(parts[parts.length-1].toLowerCase()));
+    }
+
+    async function compressPng(blob) {
+      if (!('createImageBitmap' in window)) return blob;
+      try {
+        const bitmap = await createImageBitmap(blob);
+        const canvas = document.createElement('canvas');
+        canvas.width = bitmap.width; canvas.height = bitmap.height;
+        canvas.getContext('2d',{alpha:true}).drawImage(bitmap,0,0);
+        bitmap.close();
+        const output = await new Promise(resolve => canvas.toBlob(resolve,'image/png'));
+        return output && output.size < blob.size ? output : blob;
+      } catch (_) { return blob; }
+    }
+
+    function flattenNumberBlocks(value) {
+      if (!Array.isArray(value)) return [];
+      const output=[];
+      value.forEach(item=>Array.isArray(item)?output.push(...flattenNumberBlocks(item)):typeof item==='number'&&output.push(item&255));
+      return output;
+    }
+
+    function extractGifRepeat(parsed) {
+      for (const block of parsed.frames || []) {
+        const application=block && block.application;
+        if (!application || !String(application.id || '').toUpperCase().includes('NETSCAPE')) continue;
+        const bytes=flattenNumberBlocks(application.blocks || application.codes || []);
+        const index=bytes.findIndex((value,offset)=>value===1 && offset+2<bytes.length);
+        if (index>=0) return bytes[index+1] | (bytes[index+2]<<8);
+      }
+      return 0;
+    }
+
+    function clearGifRect(canvas,width,left,top,rectWidth,rectHeight) {
+      const height=canvas.length/4/width;
+      const x0=Math.max(0,left), y0=Math.max(0,top), x1=Math.min(width,left+rectWidth), y1=Math.min(height,top+rectHeight);
+      for(let y=y0;y<y1;y++) canvas.fill(0,(y*width+x0)*4,(y*width+x1)*4);
+    }
+
+    function drawGifPatch(canvas,screenWidth,screenHeight,frame) {
+      const dims=frame.dims, patch=frame.patch;
+      for(let y=0;y<dims.height;y++) {
+        const dstY=dims.top+y; if(dstY<0||dstY>=screenHeight) continue;
+        for(let x=0;x<dims.width;x++) {
+          const dstX=dims.left+x; if(dstX<0||dstX>=screenWidth) continue;
+          const src=(y*dims.width+x)*4; if(patch[src+3]===0) continue;
+          const dst=(dstY*screenWidth+dstX)*4;
+          canvas[dst]=patch[src]; canvas[dst+1]=patch[src+1]; canvas[dst+2]=patch[src+2]; canvas[dst+3]=255;
+        }
+      }
+    }
+
+    function buildGifIndexedFrame(rgba,maxColors) {
+      const transparent=rgba.some ? rgba.some((value,index)=>index%4===3&&value===0) : false;
+      const format=transparent?'rgba4444':'rgb565';
+      const palette=Gifenc.quantize(rgba,maxColors,{format,oneBitAlpha:transparent?127:false,clearAlpha:true,clearAlphaThreshold:127,clearAlphaColor:0});
+      let transparentIndex=transparent?palette.findIndex(color=>(color[3]===undefined?255:color[3])<=127):-1;
+      if(transparent && transparentIndex<0) {
+        if(palette.length<maxColors) { palette.push([0,0,0,0]); transparentIndex=palette.length-1; }
+        else { transparentIndex=palette.length-1; palette[transparentIndex]=[0,0,0,0]; }
+      }
+      const indexes=Gifenc.applyPalette(rgba,palette,format);
+      if(transparentIndex>=0) {
+        for(let offset=3,pixel=0;offset<rgba.length;offset+=4,pixel++) {
+          if(rgba[offset]<=127) { indexes[pixel]=transparentIndex; continue; }
+          if(indexes[pixel]!==transparentIndex) continue;
+          let nearest=transparentIndex, best=Number.POSITIVE_INFINITY;
+          for(let paletteIndex=0;paletteIndex<palette.length;paletteIndex++) {
+            if(paletteIndex===transparentIndex || (palette[paletteIndex][3]!==undefined&&palette[paletteIndex][3]<=127)) continue;
+            const color=palette[paletteIndex];
+            const dr=rgba[offset-3]-color[0], dg=rgba[offset-2]-color[1], db=rgba[offset-1]-color[2];
+            const distance=dr*dr+dg*dg+db*db;
+            if(distance<best) { best=distance; nearest=paletteIndex; }
+          }
+          indexes[pixel]=nearest;
+        }
+      }
+      return {palette,indexes,transparentIndex};
+    }
+
+    async function compressGif(blob) {
+      if(!window.GifuctJS || !window.Gifenc) return blob;
+      try {
+        const input=await blob.arrayBuffer();
+        const parsed=GifuctJS.parseGIF(input);
+        const frames=GifuctJS.decompressFrames(parsed,true);
+        const width=Number(parsed.lsd && parsed.lsd.width || 0), height=Number(parsed.lsd && parsed.lsd.height || 0);
+        if(!width||!height||!frames.length||width*height>16000000||frames.length>600) return blob;
+        const canvas=new Uint8Array(width*height*4);
+        const encoder=Gifenc.GIFEncoder({initialCapacity:Math.min(Math.max(blob.size,4096),16*1024*1024)});
+        const repeat=extractGifRepeat(parsed);
+        for(let index=0;index<frames.length;index++) {
+          const frame=frames[index], restore=Number(frame.disposalType)===3?canvas.slice():null;
+          drawGifPatch(canvas,width,height,frame);
+          const indexed=buildGifIndexedFrame(canvas,128);
+          encoder.writeFrame(indexed.indexes,width,height,{
+            palette:indexed.palette,
+            delay:Math.max(0,Number(frame.delay||0)),
+            repeat:index===0?repeat:-1,
+            transparent:indexed.transparentIndex>=0,
+            transparentIndex:Math.max(0,indexed.transparentIndex),
+            dispose:indexed.transparentIndex>=0?2:1
+          });
+          if(Number(frame.disposalType)===2) clearGifRect(canvas,width,frame.dims.left,frame.dims.top,frame.dims.width,frame.dims.height);
+          else if(restore) canvas.set(restore);
+          if(index%8===7) await new Promise(resolve=>setTimeout(resolve,0));
+        }
+        encoder.finish();
+        const bytes=encoder.bytes();
+        const output=new Blob([bytes],{type:'image/gif'});
+        return output.size<blob.size?output:blob;
+      } catch (_) { return blob; }
+    }
+
+    async function repairAudio(blob,relativeName,bridgeId) {
+      const body = new FormData();
+      body.append('sessionToken',state.sessionToken);
+      body.append('bridgeId',bridgeId);
+      body.append('originalFilename',relativeName);
+      body.append('file',blob,relativeName.split('/').pop() || 'audio.bin');
+      const response = await fetch(`${state.apiBase}/api/file-manage/direct-upload/repair-audio`,{method:'POST',body,cache:'no-store',credentials:'omit'});
+      if (!response.ok) throw new Error(`音效修复失败(${response.status})`);
+      const payload = await response.json();
+      const data = payload.data || payload;
+      const repair = data.audio_repair || {};
+      const repaired = data.repaired === true || repair.repaired === true;
+      const downloadUrl = String(data.download_url || data.url || '').trim();
+      if (!repaired || !downloadUrl) return {blob,repaired:false};
+      const absoluteUrl = new URL(downloadUrl,state.apiBase).toString();
+      const repairedResponse = await fetch(absoluteUrl,{cache:'no-store',credentials:'omit'});
+      if (!repairedResponse.ok) throw new Error(`修复音效下载失败(${repairedResponse.status})`);
+      return {blob:await repairedResponse.blob(),repaired:true};
+    }
+
+    function isEncryptedArchiveError(error) {
+      return /encrypt|password|密码|加密/i.test(String(error && error.message || error || ''));
+    }
+
+    async function processArchiveBlob(sourceBlob,plan,onProgress,depth=0,prefix='') {
+      if (!ARCHIVE_EXTENSIONS.has(extension(prefix || plan.fileName))) return sourceBlob;
+      onProgress(depth===0?'正在读取压缩包':`正在读取内层压缩包 ${prefix}`);
+      let zip;
+      try { zip = await JSZip.loadAsync(sourceBlob,{checkCRC32:true,createFolders:true}); }
+      catch (error) {
+        if(isEncryptedArchiveError(error)) throw new Error(`压缩包已加密，无法处理: ${prefix || plan.fileName}`);
+        // 现有小程序 ZipHelper 能兼容少量非标准中央目录；浏览器 JSZip 读不了时不应
+        // 误删或改写用户文件，保持原始 Blob 上传，由后续人工检查处理。
+        onProgress(`压缩包兼容读取失败，使用原文件: ${prefix || plan.fileName}`);
+        return sourceBlob;
+      }
+
+      const entries = Object.values(zip.files);
+      let removed = 0, repaired = 0, imageCompressed = 0, nestedProcessed = 0, changed = false;
+      for (let index=0; index<entries.length; index++) {
+        const entry = entries[index];
+        if (entry.dir) continue;
+        onProgress(`正在整理压缩包 ${index+1}/${entries.length}`);
+        if (isSystemEntry(entry.name)) { zip.remove(entry.name); removed++; changed=true; continue; }
+        const ext = extension(entry.name);
+        if (plan.compressEnabled && ext === 'png') {
+          const original = await entry.async('blob');
+          const compressed = await compressPng(original);
+          if (compressed.size < original.size) { zip.file(entry.name,compressed,{binary:true}); imageCompressed++; changed=true; }
+        } else if (plan.compressEnabled && ext === 'gif') {
+          const original = await entry.async('blob');
+          const compressed = await compressGif(original);
+          if (compressed.size < original.size) { zip.file(entry.name,compressed,{binary:true}); imageCompressed++; changed=true; }
+        }
+        if (AUDIO_EXTENSIONS.has(ext)) {
+          const original = await entry.async('blob');
+          const repair = await repairAudio(original,entry.name,plan.bridgeId);
+          if (repair.repaired) { zip.file(entry.name,repair.blob,{binary:true}); repaired++; changed=true; }
+        } else if (depth<2 && ARCHIVE_EXTENSIONS.has(ext)) {
+          const original=await entry.async('blob');
+          const nested=await processArchiveBlob(original,plan,onProgress,depth+1,entry.name);
+          if(nested!==original) { zip.file(entry.name,nested,{binary:true}); nestedProcessed++; changed=true; }
+        }
+      }
+      if(!changed) return sourceBlob;
+      onProgress(`正在重新打包（清理${removed}，图片${imageCompressed}，音效${repaired}，内层${nestedProcessed}）`);
+      const output=await zip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:6},streamFiles:true});
+      // 系统文件清理或音效修复即使略增体积也必须保留；纯图片处理则延续旧逻辑，
+      // 最终归档没有体积收益时回退原文件。
+      return (removed>0||repaired>0||nestedProcessed>0||output.size<sourceBlob.size)?output:sourceBlob;
+    }
+
+    async function processArchive(stored,plan,onProgress) {
+      return processArchiveBlob(stored.blob,plan,onProgress,0,plan.fileName);
+    }
+
+    async function md5Blob(blob,onProgress) {
+      const chunkSize = 4*1024*1024;
+      const chunks = Math.max(1,Math.ceil(blob.size/chunkSize));
+      const spark = new SparkMD5.ArrayBuffer();
+      for (let index=0; index<chunks; index++) {
+        spark.append(await blob.slice(index*chunkSize,Math.min(blob.size,(index+1)*chunkSize)).arrayBuffer());
+        onProgress(`正在校验文件 ${index+1}/${chunks}`);
+      }
+      return spark.end();
+    }
+
+    async function apiPost(path,data) {
+      const response = await fetch(`${state.apiBase}${path}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),cache:'no-store',credentials:'omit'});
+      const payload = await response.json().catch(()=>({}));
+      if (!response.ok || payload.success === false) throw new Error(payload.detail || payload.message || `接口响应异常(${response.status})`);
+      return payload.data || payload;
+    }
+
+    function uploadOfficial(blob,params,onProgress) {
+      return new Promise((resolve,reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST',params.uploadUrl,true);
+        xhr.setRequestHeader('Authorization',`Bearer ${params.accessToken}`);
+        xhr.setRequestHeader('Platform','open_platform');
+        xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(`正在上传 ${Math.round(event.loaded/event.total*100)}%`,Math.round(event.loaded/event.total*100)); };
+        xhr.onerror = () => reject(new Error('云端上传网络异常'));
+        xhr.ontimeout = () => reject(new Error('云端上传超时'));
+        xhr.onload = () => {
+          let payload={}; try { payload=JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+          if (xhr.status<200 || xhr.status>=300 || ![undefined,null,0,'0',200,'200'].includes(payload.code)) {
+            reject(new Error(payload.message || payload.msg || `云端上传失败(${xhr.status})`)); return;
+          }
+          const data = payload.data || payload;
+          const fileId = Number(data.fileID || data.fileId || data.file_id || 0);
+          if (!Number.isFinite(fileId) || fileId<=0) { reject(new Error('云端上传响应缺少文件编号')); return; }
+          resolve(Math.floor(fileId));
+        };
+        const form = new FormData();
+        form.append('parentFileID',String(params.parentFileID));
+        form.append('filename',params.filename);
+        form.append('etag',params.etag);
+        form.append('size',String(params.size));
+        form.append('duplicate',String(params.duplicate || 2));
+        form.append('file',blob,params.filename);
+        xhr.timeout = Math.min(Math.max(120000,Math.ceil(blob.size/1024/1024)*10000),30*60*1000);
+        xhr.send(form);
+      });
+    }
+
+    function renderUploadFiles(plans) {
+      fileList.innerHTML='';
+      plans.forEach(plan => {
+        const row=document.createElement('div'); row.className='file'; row.dataset.bridgeId=plan.bridgeId;
+        row.innerHTML='<div class="name"></div><div class="meta">等待处理</div><div class="bar"><i></i></div>';
+        row.querySelector('.name').textContent=plan.fileName;
+        fileList.appendChild(row);
+      });
+    }
+
+    function updateFileProgress(bridgeId,text,progress) {
+      const row=fileList.querySelector(`[data-bridge-id="${CSS.escape(bridgeId)}"]`);
+      if (!row) return;
+      row.querySelector('.meta').textContent=text;
+      if (typeof progress==='number') row.querySelector('.bar i').style.width=`${Math.max(0,Math.min(100,progress))}%`;
+      postMessage({type:'manageDirectProgress',bridgeId,text,progress:typeof progress==='number'?progress:-1});
+    }
+
+    async function uploadOne(plan) {
+      const stored=await getStoredFile(plan.bridgeId);
+      if (!stored || !(stored.blob instanceof Blob)) throw new Error('本地暂存文件已失效，请重新选择');
+      const processed=await processArchive(stored,plan,text=>updateFileProgress(plan.bridgeId,text,5));
+      const md5=await md5Blob(processed,text=>updateFileProgress(plan.bridgeId,text,10));
+      const params=await apiPost('/api/file-manage/direct-upload/prepare',{sessionToken:state.sessionToken,bridgeId:plan.bridgeId,fileSize:processed.size,fileMd5:md5});
+      // AT 只在当前函数局部变量中使用；上传请求完成后立即清空引用。用户仍可通过
+      // 自己设备的网络调试工具看到请求头，这是当前“服务账号 AT 直发 H5”方案的既知边界。
+      let fileId=0;
+      try {
+        fileId=await uploadOfficial(processed,params,(text,progress)=>updateFileProgress(plan.bridgeId,text,10+Math.round(progress*.8)));
+      } finally {
+        // 无论上传成功还是网络异常，都尽快释放当前 AT 字符串引用。
+        params.accessToken='';
+      }
+      const result=await apiPost('/api/file-manage/direct-upload/complete',{sessionToken:state.sessionToken,bridgeId:plan.bridgeId,pan123FileId:fileId});
+      updateFileProgress(plan.bridgeId,'上传完成',100);
+      await deleteStoredFile(plan.bridgeId);
+      return result;
+    }
+
+    async function runPool(items,worker,limit) {
+      let next=0; const results=new Array(items.length);
+      const runners=Array.from({length:Math.min(limit,items.length)},async()=>{ while(next<items.length){const index=next++;try{results[index]={success:true,result:await worker(items[index])};}catch(error){results[index]={success:false,bridgeId:items[index].bridgeId,error:error instanceof Error?error.message:String(error)};updateFileProgress(items[index].bridgeId,results[index].error,0);}} });
+      await Promise.all(runners); return results;
+    }
+
+    async function startUploadMode() {
+      picker.classList.add('hidden'); actions.classList.add('hidden');
+      intro.textContent='正在处理并上传文件，请保持页面开启。'; setStatus('正在读取上传计划...');
+      const manifest=await apiPost('/api/file-manage/direct-upload/status',{sessionToken:state.sessionToken});
+      const completed=(manifest.files || [])
+        .filter(item=>item.status==='completed' && item.result)
+        .map(item=>({success:true,result:item.result}));
+      const plans=(manifest.files || []).filter(item=>item.status!=='completed');
+      renderUploadFiles(plans);
+      if (!plans.length) {
+        postMessage({type:'manageDirectUploadResult',complete:true,successCount:completed.length,failedCount:0,results:completed});
+        navigateBack(); return;
+      }
+      const currentResults=await runPool(plans,uploadOne,MAX_CONCURRENCY);
+      const results=[...completed,...currentResults];
+      const successCount=results.filter(item=>item.success).length;
+      const failedCount=results.length-successCount;
+      postMessage({type:'manageDirectUploadResult',complete:true,successCount,failedCount,results});
+      setStatus(failedCount?`上传完成：成功 ${successCount}，失败 ${failedCount}`:`已成功上传 ${successCount} 个文件`,failedCount>0);
+      navigateBack();
+    }
+
+    fileInput.addEventListener('change',event=>selectFiles(event.target.files).catch(error=>setStatus(error.message||String(error),true)));
+    clearButton.addEventListener('click',async()=>{for(const item of state.files)await deleteStoredFile(item.bridgeId);state.files=[];fileInput.value='';renderSelection();});
+    confirmButton.addEventListener('click',()=>confirmSelection().catch(error=>setStatus(error.message||String(error),true)));
+
+    async function boot() {
+      await cleanupExpiredFiles();
+      const params=parseHash(); state.mode=params.mode || 'select';
+      if (state.mode==='upload') {
+        state.sessionToken=String(params.sessionToken || '').trim();
+        state.apiBase=String(params.apiBase || '').trim().replace(/\/+$/,'');
+        if (!state.sessionToken || !/^https:\/\//i.test(state.apiBase)) throw new Error('上传会话参数无效');
+        await startUploadMode();
+      } else { renderSelection(); }
+    }
+
+    boot().catch(error=>{setStatus(error instanceof Error?error.message:String(error),true);postMessage({type:'manageDirectUploadResult',complete:true,successCount:0,failedCount:1,error:error instanceof Error?error.message:String(error)});});
+  })();
+  </script>
+</body>
+</html>
