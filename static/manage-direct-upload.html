@@ -107,7 +107,20 @@
     async function fetchUntilNon522(url,options,onRetry) {
       let retryCount=0;
       while(true) {
-        const response=await fetch(url,options);
+        let response;
+        try {
+          response=await fetch(url,options);
+        } catch (error) {
+          // 跨域 fetch 遇到 CDN 522 且错误页没有 CORS 头时，浏览器不会暴露
+          // response.status，只会抛 TypeError: Failed to fetch。此时无法和 DNS、
+          // TLS 等瞬态网络失败区分，只能按同一退避策略重放；用户离开 WebView
+          // 后浏览器会销毁页面并停止这些等待任务。
+          retryCount++;
+          const delayMs=retry522Delay(retryCount);
+          onRetry?.(retryCount,delayMs,error);
+          await wait(delayMs);
+          continue;
+        }
         if(response.status!==HTTP_522_STATUS) return response;
         retryCount++;
         const delayMs=retry522Delay(retryCount);
@@ -474,20 +487,30 @@
         let retryCount=0;
         const startAttempt=()=>{
           const xhr = new XMLHttpRequest();
+          let attemptFinished=false;
+          const retryNetworkAttempt=()=>{
+            if(attemptFinished) return;
+            attemptFinished=true;
+            retryCount++;
+            const delayMs=retry522Delay(retryCount);
+            // XHR 与 fetch 一样，CORS 层可能把 522 折叠成 status=0/onerror。
+            // 重建 FormData 和 XMLHttpRequest，保证 Blob 可以从头重新发送。
+            onProgress(retry522Text('云端上传节点',retryCount,delayMs),0);
+            setTimeout(startAttempt,delayMs);
+          };
           xhr.open('POST',params.uploadUrl,true);
           xhr.setRequestHeader('Authorization',`Bearer ${params.accessToken}`);
           xhr.setRequestHeader('Platform','open_platform');
           xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(`正在上传 ${Math.round(event.loaded/event.total*100)}%`,Math.round(event.loaded/event.total*100)); };
-          xhr.onerror = () => reject(new Error('云端上传网络异常'));
-          xhr.ontimeout = () => reject(new Error('云端上传超时'));
+          xhr.onerror = retryNetworkAttempt;
+          xhr.ontimeout = retryNetworkAttempt;
           xhr.onload = () => {
+            if(attemptFinished) return;
             if(xhr.status===HTTP_522_STATUS) {
-              retryCount++;
-              const delayMs=retry522Delay(retryCount);
-              onProgress(retry522Text('云端上传节点',retryCount,delayMs),0);
-              setTimeout(startAttempt,delayMs);
+              retryNetworkAttempt();
               return;
             }
+            attemptFinished=true;
             let payload={}; try { payload=JSON.parse(xhr.responseText || '{}'); } catch (_) {}
             if (xhr.status<200 || xhr.status>=300 || ![undefined,null,0,'0',200,'200'].includes(payload.code)) {
               reject(new Error(payload.message || payload.msg || `云端上传失败(${xhr.status})`)); return;
