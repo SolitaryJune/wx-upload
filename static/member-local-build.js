@@ -1323,7 +1323,10 @@
     state.manifest = manifest;
     const completed = (manifest.files || []).filter(item => item.status === 'completed');
     const plans = (manifest.files || []).filter(item => item.status !== 'completed');
-    summaryEl.textContent = `共 ${manifest.files.length} 个文件，浏览器将依次处理并保存到您的网盘。`;
+    const fallbackCount = Math.max(0, Number(manifest.fallbackCount || 0));
+    summaryEl.textContent = fallbackCount > 0
+      ? `本地构建 ${manifest.files.length} 个文件；另有 ${fallbackCount} 个不支持文件将在返回小程序后单独提交服务器处理。`
+      : `共 ${manifest.files.length} 个文件，浏览器将依次处理并保存到您的网盘。`;
     renderFiles(manifest.files || []);
     completed.forEach(item => updateFileProgress(item.fileKey, '已完成', 100, 0));
 
