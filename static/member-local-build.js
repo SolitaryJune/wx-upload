@@ -5,6 +5,9 @@
   const HTTP_522_RETRY_BASE_DELAY_MS = 800;
   const HTTP_522_RETRY_MAX_DELAY_MS = 8000;
   const DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
+  const BAIDU_TMP_UPLOAD_TIMEOUT_MS = 30 * 60 * 1000;
+  const BAIDU_TMP_UPLOAD_MAX_ATTEMPTS = 3;
+  const BAIDU_UPLOAD_CONFIRM_MAX_CYCLES = 3;
   const AUDIO_PROCESS_MAX_BYTES = 24 * 1024 * 1024;
   const FONT_WORKER_URL = './vendor/font-marker.worker.js?v=1';
   // 与小程序 api.ts 共用的算法兼容值会随客户端公开下发，不作为鉴权密钥使用。
@@ -809,7 +812,9 @@
     const trailing = token.match(/\s*$/)?.[0] || '';
     let core = token.trim();
     let quote = '';
-    if (core.length >= 2 && ['"', "'"].includes(core[0]) && core.at(-1) === core[0]) {
+    // 微信 WebView 的部分内核没有 Array/String.prototype.at；这里使用传统下标，
+    // 否则处理带引号的 archive comment 时会直接抛出 ``parts.at is not a function``。
+    if (core.length >= 2 && ['"', "'"].includes(core[0]) && core[core.length - 1] === core[0]) {
       quote = core[0]; core = core.slice(1, -1);
     }
     core = normalizeResourcePath(core.trim());
@@ -945,7 +950,7 @@
   function isSystemEntry(path) {
     const parts = String(path || '').replace(/\\/g, '/').split('/').filter(Boolean);
     return parts.some(part => part.toLowerCase() === '__macosx' || part.startsWith('.')) ||
-      (parts.length > 0 && SYSTEM_NAMES.has(parts.at(-1).toLowerCase()));
+      (parts.length > 0 && SYSTEM_NAMES.has(parts[parts.length - 1].toLowerCase()));
   }
 
   function validateArchiveEntries(zip) {
@@ -1203,7 +1208,7 @@
     return spark.end();
   }
 
-  function uploadOfficial(blob, params, onProgress) {
+  function uploadPan123Official(blob, params, onProgress) {
     return new Promise((resolve, reject) => {
       let retryCount = 0;
       const startAttempt = () => {
@@ -1254,6 +1259,83 @@
     });
   }
 
+  function isRetryableUploadConfirmError(error) {
+    const statusCode = Number(error && error.statusCode || 0);
+    return statusCode === 0 || statusCode === 408 || statusCode === 429 || statusCode >= 500;
+  }
+
+  async function uploadBaiduTmp(blob, filename, uploadUrl, onProgress) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= BAIDU_TMP_UPLOAD_MAX_ATTEMPTS; attempt++) {
+      const controller = window.AbortController ? new AbortController() : null;
+      const timeoutId = controller
+        ? setTimeout(() => controller.abort(), BAIDU_TMP_UPLOAD_TIMEOUT_MS)
+        : 0;
+      try {
+        // no-cors 响应是 opaque，浏览器无法读取百度返回的 HTTP 状态。这里仅表示请求
+        // 已完成发送，不能据此判定上传成功；真正的成功事实由后续 Server create 确认。
+        const form = new FormData();
+        form.append('file', blob, filename);
+        onProgress(`正在保存到百度网盘（上传文件体 ${attempt}/${BAIDU_TMP_UPLOAD_MAX_ATTEMPTS}）`, 35);
+        await fetch(uploadUrl, {
+          method: 'POST',
+          mode: 'no-cors',
+          body: form,
+          ...(controller ? { signal: controller.signal } : {}),
+        });
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt >= BAIDU_TMP_UPLOAD_MAX_ATTEMPTS) break;
+        const delay = Math.min(8000, 1500 * Math.pow(2, attempt - 1));
+        onProgress(`百度网盘文件体上传中断，${Math.ceil(delay / 1000)} 秒后重试`, 35);
+        await wait(delay);
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
+    }
+    if (lastError && lastError.name === 'AbortError') {
+      throw new Error('百度网盘文件体上传超时');
+    }
+    throw lastError || new Error('百度网盘文件体上传失败');
+  }
+
+  async function completeBaiduUpload(blob, plan, upload, onProgress) {
+    const complete = () => apiPost(
+      '/api/member/local-build-h5/complete-upload',
+      { sessionToken: state.sessionToken, fileKey: plan.fileKey },
+      (count, delay) => onProgress(retry522Text('百度上传结果服务', count, delay), 96)
+    );
+
+    if (upload.reuse && Number(upload.fsId || 0) > 0) {
+      onProgress('正在确认百度网盘秒传结果...', 96);
+      return complete();
+    }
+    if (!upload.uploadUrl) throw new Error('百度网盘预上传响应缺少上传地址');
+
+    let lastError = null;
+    for (let cycle = 1; cycle <= BAIDU_UPLOAD_CONFIRM_MAX_CYCLES; cycle++) {
+      await uploadBaiduTmp(blob, upload.filename || plan.outputFileName, upload.uploadUrl, (text, value) => {
+        onProgress(text, 75 + Math.round(Number(value || 0) * 0.2));
+      });
+      try {
+        onProgress('正在确认百度网盘保存结果...', 96);
+        return await complete();
+      } catch (error) {
+        lastError = error;
+        // opaque 请求可能隐藏百度数据面 4xx/5xx。只有控制面返回可重试错误时才重放
+        // 同一 uploadId 的完整文件体；会话错误、参数错误等 4xx 必须立即停止。
+        if (!isRetryableUploadConfirmError(error) || cycle >= BAIDU_UPLOAD_CONFIRM_MAX_CYCLES) {
+          throw error;
+        }
+        const delay = Math.min(8000, 1500 * Math.pow(2, cycle - 1));
+        onProgress(`百度网盘保存确认失败，${Math.ceil(delay / 1000)} 秒后重新上传文件体`, 82);
+        await wait(delay);
+      }
+    }
+    throw lastError || new Error('百度网盘上传确认失败');
+  }
+
   async function processOne(plan, fileIndex, fileCount) {
     const progress = (text, value) => updateFileProgress(plan.fileKey, text, value, overallForFile(fileIndex, fileCount, value));
     progress('正在获取服务器下发文件计划...', 0);
@@ -1266,17 +1348,29 @@
       { sessionToken: state.sessionToken, fileKey: plan.fileKey, fileSize: processed.size, fileMd5: md5 },
       (count, delay) => progress(retry522Text('上传准备服务', count, delay), 75)
     );
-    let fileId = 0;
-    try {
-      fileId = await uploadOfficial(processed, upload, (text, value) => progress(text, 75 + Math.round(Number(value || 0) * 0.2)));
-    } finally {
-      upload.accessToken = '';
+    const provider = String(upload.provider || state.manifest.destinationProvider || '').trim();
+    if (provider === 'baidu') {
+      await completeBaiduUpload(processed, plan, upload, (text, value) => progress(text, value));
+    } else if (provider === 'pan123') {
+      let fileId = 0;
+      try {
+        fileId = await uploadPan123Official(
+          processed,
+          upload,
+          (text, value) => progress(text, 75 + Math.round(Number(value || 0) * 0.2))
+        );
+      } finally {
+        // AT 只在当前函数的 prepare 响应中短暂使用，上传结束立即清空引用。
+        upload.accessToken = '';
+      }
+      await apiPost(
+        '/api/member/local-build-h5/complete-upload',
+        { sessionToken: state.sessionToken, fileKey: plan.fileKey, pan123FileId: fileId },
+        (count, delay) => progress(retry522Text('上传结果服务', count, delay), 96)
+      );
+    } else {
+      throw new Error('本地构建目标网盘无效');
     }
-    await apiPost(
-      '/api/member/local-build-h5/complete-upload',
-      { sessionToken: state.sessionToken, fileKey: plan.fileKey, pan123FileId: fileId },
-      (count, delay) => progress(retry522Text('上传结果服务', count, delay), 96)
-    );
     progress('文件处理完成', 100);
   }
 
@@ -1321,12 +1415,16 @@
       (count, delay) => setStatus(retry522Text('文件会话服务', count, delay))
     );
     state.manifest = manifest;
+    const destinationProvider = String(manifest.destinationProvider || '').trim();
+    if (!['pan123', 'baidu'].includes(destinationProvider)) {
+      throw new Error('服务器下发文件目标网盘无效');
+    }
     const completed = (manifest.files || []).filter(item => item.status === 'completed');
     const plans = (manifest.files || []).filter(item => item.status !== 'completed');
     const fallbackCount = Math.max(0, Number(manifest.fallbackCount || 0));
     summaryEl.textContent = fallbackCount > 0
-      ? `本地构建 ${manifest.files.length} 个文件；另有 ${fallbackCount} 个不支持文件将在返回小程序后单独提交服务器处理。`
-      : `共 ${manifest.files.length} 个文件，浏览器将依次处理并保存到您的网盘。`;
+      ? `本地构建 ${manifest.files.length} 个文件并保存到目标网盘；另有 ${fallbackCount} 个不支持文件将在返回小程序后单独提交服务器处理。`
+      : `共 ${manifest.files.length} 个文件，浏览器将依次处理并保存到您的目标网盘。`;
     renderFiles(manifest.files || []);
     completed.forEach(item => updateFileProgress(item.fileKey, '已完成', 100, 0));
 
@@ -1347,7 +1445,9 @@
       complete: true,
       success: true,
       taskId: result.taskId,
+      provider: result.provider || destinationProvider,
       folderId: result.folderId,
+      remoteFolderId: result.remoteFolderId,
       folderPath: result.folderPath,
       fileCount: result.fileCount,
     });
