@@ -650,6 +650,8 @@
         navigateBackToMiniProgram();
       } catch (error) {
         clearTimeout(timeoutTimer);
+        // 校验/桥接失败后立即中止底层响应流，不能只释放并发租约却让下载继续占网路和内存。
+        controller.abort();
         await releaseDownloadSlot();
         const message = error && error.name === 'AbortError'
           ? 'H5 下载超时'

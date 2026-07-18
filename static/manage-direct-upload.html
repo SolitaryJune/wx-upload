@@ -52,6 +52,12 @@
     const HTTP_522_STATUS = 522;
     const HTTP_522_RETRY_BASE_DELAY_MS = 800;
     const HTTP_522_RETRY_MAX_DELAY_MS = 8000;
+    const CONTROL_REQUEST_MAX_RETRIES = 8;
+    const INVALID_SERVER_RESPONSE_MAX_RETRIES = 3;
+    const PAN123_UPLOAD_MAX_ATTEMPTS = 3;
+    const ARCHIVE_MAX_ENTRIES = 20000;
+    const ARCHIVE_MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024;
+    const ARCHIVE_MAX_COMPRESSION_RATIO = 300;
     const state = { mode:'select', files:[], sessionToken:'', apiBase:'', running:false };
 
     const fileInput = document.getElementById('fileInput');
@@ -99,10 +105,68 @@
       return `${label}连接超时，${seconds} 秒后重试（第 ${retryCount} 次）`;
     }
 
+    function extractApiErrorMessage(payload,fallback) {
+      const detail=payload && payload.detail;
+      if(typeof detail==='string' && detail.trim()) return detail.trim();
+      if(detail && typeof detail==='object') {
+        const message=detail.message || detail.error || detail.msg;
+        if(typeof message==='string' && message.trim()) return message.trim();
+      }
+      const message=payload && (payload.message || payload.error || payload.msg);
+      return typeof message==='string' && message.trim()?message.trim():fallback;
+    }
+
+    function createDiagnosticEventId() {
+      if (crypto.randomUUID) return crypto.randomUUID();
+      return `h5_${Date.now()}_${crypto.getRandomValues(new Uint32Array(2)).join('_')}`;
+    }
+
+    function sanitizeDiagnosticMessage(value) {
+      return String(value || '')
+        .replace(/https?:\/\/\S+\?\S+/gi,'[REDACTED_URL]')
+        .replace(/(access[_-]?token|authorization|session[_-]?token|upload[_-]?url)\s*[:=]\s*\S+/gi,'$1=[REDACTED]')
+        .slice(0,500);
+    }
+
     /**
-     * H5 数据面与小程序保持同一条 522 规则：只要 CDN 仍返回 522，就使用完全相同的
-     * 请求参数持续重试；收到任意非 522 响应后立即交还业务逻辑处理。网络异常、4xx、
-     * 其它 5xx 都不是 522，不在这里吞掉，避免把真实错误伪装成无限等待。
+     * 错误上报永远不能阻断上传。正文只包含 Server 白名单字段；不上传响应原文、
+     * accessToken、uploadUrl 或完整远端路径。fetch 失败时用 sendBeacon 做一次卸载兼容补发，
+     * eventId 唯一约束会在 Server 端去重。
+     */
+    function reportUploadError(plan,details) {
+      if (!state.sessionToken || !plan?.bridgeId || !state.apiBase) return Promise.resolve();
+      const payload={
+        sessionToken:state.sessionToken,
+        bridgeId:plan.bridgeId,
+        eventId:String(details.eventId || createDiagnosticEventId()),
+        stage:String(details.stage || 'upload').slice(0,80),
+        errorCode:String(details.errorCode || 'H5_UPLOAD_ERROR').slice(0,100),
+        provider:'pan123',
+        message:sanitizeDiagnosticMessage(details.message),
+        httpStatus:Number.isFinite(Number(details.httpStatus))?Number(details.httpStatus):null,
+        readyState:Number.isFinite(Number(details.readyState))?Number(details.readyState):null,
+        responseLength:Number.isFinite(Number(details.responseLength))?Number(details.responseLength):null,
+        contentType:String(details.contentType || '').slice(0,120),
+        jsonParseSucceeded:typeof details.jsonParseSucceeded==='boolean'?details.jsonParseSucceeded:null,
+        payloadCode:String(details.payloadCode ?? '').slice(0,80),
+        dataKeys:Array.isArray(details.dataKeys)?details.dataKeys.slice(0,20).map(key=>String(key).slice(0,40)):[],
+        uploadAttempt:Number.isFinite(Number(details.uploadAttempt))?Number(details.uploadAttempt):null,
+        networkRetryCount:Number.isFinite(Number(details.networkRetryCount))?Number(details.networkRetryCount):null,
+        elapsedMs:Number.isFinite(Number(details.elapsedMs))?Number(details.elapsedMs):null,
+        timeoutMs:Number.isFinite(Number(details.timeoutMs))?Number(details.timeoutMs):null,
+        fallbackAttempted:typeof details.fallbackAttempted==='boolean'?details.fallbackAttempted:null,
+        fallbackSucceeded:typeof details.fallbackSucceeded==='boolean'?details.fallbackSucceeded:null,
+      };
+      const url=`${state.apiBase}/api/file-manage/direct-upload/report-error`;
+      const body=JSON.stringify(payload);
+      return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body,cache:'no-store',credentials:'omit',keepalive:true})
+        .catch(()=>{try{navigator.sendBeacon?.(url,new Blob([body],{type:'application/json'}));}catch(_){}})
+        .then(()=>undefined);
+    }
+
+    /**
+     * H5 控制面遇到 522/不可见网络错误时按相同参数有限退避。超过上限后把明确错误
+     * 交给文件流程和诊断上报，避免页面永久等待；4xx 和其它明确响应仍立即交还业务逻辑。
      */
     async function fetchUntilNon522(url,options,onRetry) {
       let retryCount=0;
@@ -116,6 +180,11 @@
           // TLS 等瞬态网络失败区分，只能按同一退避策略重放；用户离开 WebView
           // 后浏览器会销毁页面并停止这些等待任务。
           retryCount++;
+          if(retryCount>CONTROL_REQUEST_MAX_RETRIES) {
+            const exhausted=new Error('服务连接多次失败，请稍后重试');
+            exhausted.code='CONTROL_REQUEST_RETRY_EXHAUSTED';
+            throw exhausted;
+          }
           const delayMs=retry522Delay(retryCount);
           onRetry?.(retryCount,delayMs,error);
           await wait(delayMs);
@@ -123,6 +192,11 @@
         }
         if(response.status!==HTTP_522_STATUS) return response;
         retryCount++;
+        if(retryCount>CONTROL_REQUEST_MAX_RETRIES) {
+          const exhausted=new Error('服务节点持续超时，请稍后重试');
+          exhausted.code='CONTROL_REQUEST_RETRY_EXHAUSTED';
+          throw exhausted;
+        }
         const delayMs=retry522Delay(retryCount);
         try { await response.body?.cancel?.(); } catch (_) {}
         onRetry?.(retryCount,delayMs);
@@ -199,7 +273,15 @@
     }
 
     async function deleteStoredFile(bridgeId) {
-      await withStore('readwrite',store => store.delete(bridgeId));
+      await deleteStoredFiles([bridgeId]);
+    }
+
+    async function deleteStoredFiles(bridgeIds) {
+      const ids=Array.from(new Set((bridgeIds || []).map(value=>String(value || '').trim()).filter(Boolean)));
+      if(!ids.length) return;
+      // 一批文件用同一 IndexedDB 事务结算，既减少 Windows/移动 WebView 频繁开库的延迟，
+      // 也避免清理到一半页面切后台时留下“部分已删、部分仍在”的不一致状态。
+      await withStore('readwrite',store=>{ids.forEach(bridgeId=>store.delete(bridgeId));});
     }
 
     async function cleanupExpiredFiles() {
@@ -235,15 +317,22 @@
     async function selectFiles(fileListValue) {
       const selected = Array.from(fileListValue || []).slice(0,MAX_FILES);
       // 用户重新选择时删除本页上一批尚未提交的 Blob，避免只能等待 24 小时 TTL 清理。
-      for (const item of state.files) await deleteStoredFile(item.bridgeId);
+      await deleteStoredFiles(state.files.map(item=>item.bridgeId));
       state.files = [];
       setStatus(`正在保存 ${selected.length} 个文件到当前设备...`);
-      for (let index=0; index<selected.length; index++) {
-        const file = selected[index];
-        const bridgeId = createBridgeId();
-        await putStoredFile({ bridgeId, blob:file, name:file.name, size:file.size, type:file.type, createdAt:Date.now() });
-        state.files.push({ bridgeId, name:file.name, size:file.size, type:file.type || 'application/octet-stream' });
-        setStatus(`正在保存文件 ${index+1}/${selected.length}`);
+      try {
+        for (let index=0; index<selected.length; index++) {
+          const file = selected[index];
+          const bridgeId = createBridgeId();
+          await putStoredFile({ bridgeId, blob:file, name:file.name, size:file.size, type:file.type, createdAt:Date.now() });
+          state.files.push({ bridgeId, name:file.name, size:file.size, type:file.type || 'application/octet-stream' });
+          setStatus(`正在保存文件 ${index+1}/${selected.length}`);
+        }
+      } catch(error) {
+        // 存储配额不足或事务中断时，本批文件没有可恢复的完整清单，立即回滚已写入 Blob。
+        await deleteStoredFiles(state.files.map(item=>item.bridgeId)).catch(()=>undefined);
+        state.files=[];
+        throw error;
       }
       statusBox.className = 'status hidden';
       renderSelection();
@@ -387,8 +476,20 @@
         {method:'POST',body,cache:'no-store',credentials:'omit'},
         (count,delay)=>onProgress?.(retry522Text('音效修复服务',count,delay))
       );
-      if (!response.ok) throw new Error(`音效修复失败(${response.status})`);
-      const payload = await response.json();
+      const responseText=await response.text();
+      let payload;
+      try { payload=JSON.parse(responseText); }
+      catch (_) {
+        throw new Error(response.ok?'音效修复响应格式异常':`音效修复失败(${response.status})`);
+      }
+      if (!response.ok || !payload || payload.success===false) {
+        const fallback=`音效修复失败(${response.status})`;
+        const detail=extractApiErrorMessage(payload,fallback);
+        const error=new Error(detail===fallback?fallback:`${detail} (${response.status})`);
+        error.code=String(payload?.code || 'AUDIO_REPAIR_FAILED');
+        error.statusCode=response.status;
+        throw error;
+      }
       const data = payload.data || payload;
       const repair = data.audio_repair || {};
       const repaired = data.repaired === true || repair.repaired === true;
@@ -408,13 +509,46 @@
       return /encrypt|password|密码|加密/i.test(String(error && error.message || error || ''));
     }
 
+    function validateArchiveEntries(zip,compressedSize) {
+      const normalized=new Set();
+      let fileCount=0,totalUncompressed=0;
+      Object.entries(zip.files).forEach(([name,entry])=>{
+        // JSZip 会净化 ../ 并把原名放入 unsafeOriginalName；必须检查原始名，
+        // 同时拒绝 POSIX 根路径、UNC、Windows 盘符和大小写折叠后的重复路径。
+        const originalName=entry.unsafeOriginalName || name;
+        const clean=String(originalName || '').replace(/\\/g,'/');
+        const parts=clean.split('/').filter(Boolean);
+        if(clean.startsWith('/') || /^[A-Za-z]:\//.test(clean) || parts.some(part=>part==='..' || part.includes('\0'))) {
+          throw new Error(`压缩包包含不安全路径：${name}`);
+        }
+        const key=parts.join('/').toLowerCase();
+        if(key && normalized.has(key)) throw new Error(`压缩包包含重复路径：${name}`);
+        if(key) normalized.add(key);
+        if(!entry.dir) {
+          fileCount++;
+          totalUncompressed+=Math.max(0,Number(entry._data && entry._data.uncompressedSize || 0));
+        }
+      });
+      if(fileCount>ARCHIVE_MAX_ENTRIES) throw new Error(`压缩包文件数量过多：${fileCount}`);
+      if(totalUncompressed>ARCHIVE_MAX_UNCOMPRESSED_BYTES) throw new Error(`压缩包解压后体积过大：${formatBytes(totalUncompressed)}`);
+      if(compressedSize>0 && totalUncompressed/compressedSize>ARCHIVE_MAX_COMPRESSION_RATIO) {
+        throw new Error('压缩包压缩比异常，无法安全在浏览器处理');
+      }
+    }
+
     async function processArchiveBlob(sourceBlob,plan,onProgress,depth=0,prefix='') {
       if (!ARCHIVE_EXTENSIONS.has(extension(prefix || plan.fileName))) return sourceBlob;
       onProgress(depth===0?'正在读取压缩包':`正在读取内层压缩包 ${prefix}`);
       let zip;
-      try { zip = await JSZip.loadAsync(sourceBlob,{checkCRC32:true,createFolders:true}); }
+      try {
+        // 不在 load 阶段开启 checkCRC32：JSZip 会为校验 CRC 预先解压所有条目，
+        // 大底包因此会被完整解压两遍。先读中央目录做体积/路径预检，实际处理条目时再按需解压。
+        zip = await JSZip.loadAsync(sourceBlob,{checkCRC32:false,createFolders:true});
+        validateArchiveEntries(zip,sourceBlob.size);
+      }
       catch (error) {
         if(isEncryptedArchiveError(error)) throw new Error(`压缩包已加密，无法处理: ${prefix || plan.fileName}`);
+        if(/不安全路径|重复路径|文件数量过多|解压后体积过大|压缩比异常/.test(String(error && error.message || error || ''))) throw error;
         // 现有小程序 ZipHelper 能兼容少量非标准中央目录；浏览器 JSZip 读不了时不应
         // 误删或改写用户文件，保持原始 Blob 上传，由后续人工检查处理。
         onProgress(`压缩包兼容读取失败，使用原文件: ${prefix || plan.fileName}`);
@@ -440,7 +574,13 @@
         }
         if (AUDIO_EXTENSIONS.has(ext)) {
           const original = await entry.async('blob');
-          const repair = await repairAudio(original,entry.name,plan.bridgeId,onProgress);
+          let repair;
+          try {
+            repair = await repairAudio(original,entry.name,plan.bridgeId,onProgress);
+          } catch (error) {
+            const reason=error instanceof Error?error.message:String(error || '未知错误');
+            throw new Error(`包内音效 ${entry.name} 修复失败：${reason}`);
+          }
           if (repair.repaired) { zip.file(entry.name,repair.blob,{binary:true}); repaired++; changed=true; }
         } else if (depth<2 && ARCHIVE_EXTENSIONS.has(ext)) {
           const original=await entry.async('blob');
@@ -477,48 +617,135 @@
         {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),cache:'no-store',credentials:'omit'},
         onRetry
       );
-      const payload = await response.json().catch(()=>({}));
-      if (!response.ok || payload.success === false) throw new Error(payload.detail || payload.message || `接口响应异常(${response.status})`);
+      const responseText=await response.text();
+      let payload;
+      try { payload=JSON.parse(responseText); }
+      catch (_) {
+        const error=new Error(`服务响应格式异常(${response.status})`);
+        error.code='SERVER_RESPONSE_INVALID'; error.statusCode=response.status;
+        error.diagnostic={
+          eventId:createDiagnosticEventId(),stage:'server_response',errorCode:'SERVER_RESPONSE_INVALID',message:error.message,
+          httpStatus:response.status,responseLength:responseText.length,contentType:response.headers.get('content-type') || '',
+          jsonParseSucceeded:false,dataKeys:[],
+        };
+        throw error;
+      }
+      if (!payload || typeof payload!=='object') {
+        const error=new Error(`服务响应格式异常(${response.status})`);
+        error.code='SERVER_RESPONSE_INVALID'; error.statusCode=response.status;
+        throw error;
+      }
+      const explicitSuccess=payload.success===true || [0,'0',200,'200'].includes(payload.code);
+      if (!response.ok || payload.success===false || !explicitSuccess) {
+        const detail=payload.detail;
+        const error=new Error(extractApiErrorMessage(payload,`接口响应异常(${response.status})`));
+        error.code=typeof detail==='object'&&detail.code?detail.code:String(payload.code || 'SERVER_REQUEST_FAILED');
+        error.statusCode=response.status;
+        error.retryable=Boolean(typeof detail==='object'&&detail.retryable);
+        throw error;
+      }
       return payload.data || payload;
     }
 
-    function uploadOfficial(blob,params,onProgress) {
+    async function apiPostWhenReady(path,data,onWait) {
+      let invalidResponseRetries=0;
+      while(true) {
+        try {
+          const result=await apiPost(path,data,(count,delay)=>onWait?.(retry522Text('服务',count,delay)));
+          if(!result.pending) return result;
+          const delaySeconds=Math.max(1,Number(result.retryAfterSeconds || 2));
+          onWait?.('同一文件正在由服务器确认，稍后继续...');
+          await wait(delaySeconds*1000);
+        } catch(error) {
+          if(error?.code==='SERVER_RESPONSE_INVALID' && invalidResponseRetries<INVALID_SERVER_RESPONSE_MAX_RETRIES) {
+            invalidResponseRetries++;
+            const delayMs=retry522Delay(invalidResponseRetries);
+            onWait?.(`服务响应不完整，${Math.ceil(delayMs/1000)} 秒后重新确认`);
+            await wait(delayMs);
+            continue;
+          }
+          throw error;
+        }
+      }
+    }
+
+    function normalizeOfficialFileId(payload,responseText) {
+      const data=payload?.data && typeof payload.data==='object'?payload.data:payload;
+      const value=data?.fileID ?? data?.fileId ?? data?.file_id;
+      let text=String(value ?? '').trim();
+      // 官方若把 64 位 ID 作为 JSON number 返回，JSON.parse 可能已经损失精度；优先
+      // 从原始响应中提取十进制文本，完整传给 Python int。
+      if(typeof value==='number' && !Number.isSafeInteger(value)) {
+        const match=String(responseText || '').match(/"(?:fileID|fileId|file_id)"\s*:\s*"?(\d+)"?/);
+        if(match) text=match[1];
+      }
+      if(!/^\d+$/.test(text)) return '';
+      text=text.replace(/^0+(?=\d)/,'');
+      return text!=='0'?text:'';
+    }
+
+    function uploadOfficial(blob,params,onProgress,uploadAttempt) {
       return new Promise((resolve,reject) => {
-        let retryCount=0;
-        const startAttempt=()=>{
-          const xhr = new XMLHttpRequest();
-          let attemptFinished=false;
-          const retryNetworkAttempt=()=>{
-            if(attemptFinished) return;
-            attemptFinished=true;
-            retryCount++;
-            const delayMs=retry522Delay(retryCount);
-            // XHR 与 fetch 一样，CORS 层可能把 522 折叠成 status=0/onerror。
-            // 重建 FormData 和 XMLHttpRequest，保证 Blob 可以从头重新发送。
-            onProgress(retry522Text('云端上传节点',retryCount,delayMs),0);
-            setTimeout(startAttempt,delayMs);
-          };
+        const xhr = new XMLHttpRequest();
+        const startedAt=Date.now();
+        let attemptFinished=false;
+        const settle=callback=>{if(attemptFinished)return;attemptFinished=true;callback();};
+        const ambiguous=(errorCode,message)=>settle(()=>resolve({
+          fileId:'',
+          ambiguous:true,
+          diagnostic:{
+            eventId:createDiagnosticEventId(),stage:'official_upload',errorCode,message,
+            httpStatus:xhr.status,readyState:xhr.readyState,responseLength:String(xhr.responseText || '').length,
+            contentType:xhr.getResponseHeader('content-type') || '',jsonParseSucceeded:null,payloadCode:'',dataKeys:[],
+            uploadAttempt,networkRetryCount:Math.max(0,uploadAttempt-1),elapsedMs:Date.now()-startedAt,timeoutMs:xhr.timeout,
+          },
+        }));
           xhr.open('POST',params.uploadUrl,true);
           xhr.setRequestHeader('Authorization',`Bearer ${params.accessToken}`);
           xhr.setRequestHeader('Platform','open_platform');
           xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(`正在上传 ${Math.round(event.loaded/event.total*100)}%`,Math.round(event.loaded/event.total*100)); };
-          xhr.onerror = retryNetworkAttempt;
-          xhr.ontimeout = retryNetworkAttempt;
+          xhr.onerror = ()=>ambiguous('OFFICIAL_UPLOAD_NETWORK_ERROR','云端上传连接中断，正在由服务器确认结果');
+          xhr.ontimeout = ()=>ambiguous('OFFICIAL_UPLOAD_TIMEOUT','云端上传等待超时，正在由服务器确认结果');
           xhr.onload = () => {
             if(attemptFinished) return;
-            if(xhr.status===HTTP_522_STATUS) {
-              retryNetworkAttempt();
+            if(xhr.status===HTTP_522_STATUS || xhr.status===0 || xhr.status>=500) {
+              ambiguous(`OFFICIAL_UPLOAD_HTTP_${xhr.status || 0}`,`云端上传节点响应异常(${xhr.status || 0})，正在由服务器确认结果`);
               return;
             }
-            attemptFinished=true;
-            let payload={}; try { payload=JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+            let payload; let jsonParseSucceeded=true;
+            try { payload=JSON.parse(xhr.responseText); }
+            catch (_) { payload={}; jsonParseSucceeded=false; }
             if (xhr.status<200 || xhr.status>=300 || ![undefined,null,0,'0',200,'200'].includes(payload.code)) {
-              reject(new Error(payload.message || payload.msg || `云端上传失败(${xhr.status})`)); return;
+              const error=new Error(payload.message || payload.msg || `云端上传失败(${xhr.status})`);
+              error.code=`OFFICIAL_UPLOAD_HTTP_${xhr.status}`;
+              error.diagnostic={
+                eventId:createDiagnosticEventId(),stage:'official_upload_response',errorCode:error.code,message:error.message,
+                httpStatus:xhr.status,readyState:xhr.readyState,responseLength:String(xhr.responseText || '').length,
+                contentType:xhr.getResponseHeader('content-type') || '',jsonParseSucceeded,
+                payloadCode:String(payload?.code ?? ''),
+                dataKeys:Object.keys(payload?.data && typeof payload.data==='object'?payload.data:payload || {}),
+                uploadAttempt,networkRetryCount:Math.max(0,uploadAttempt-1),elapsedMs:Date.now()-startedAt,timeoutMs:xhr.timeout,
+              };
+              settle(()=>reject(error)); return;
             }
-            const data = payload.data || payload;
-            const fileId = Number(data.fileID || data.fileId || data.file_id || 0);
-            if (!Number.isFinite(fileId) || fileId<=0) { reject(new Error('云端上传响应缺少文件编号')); return; }
-            resolve(Math.floor(fileId));
+            const fileId=normalizeOfficialFileId(payload,xhr.responseText);
+            if(!fileId) {
+              settle(()=>resolve({
+                fileId:'',ambiguous:true,
+                diagnostic:{
+                  eventId:createDiagnosticEventId(),stage:'official_upload_response',
+                  errorCode:jsonParseSucceeded?'OFFICIAL_UPLOAD_FILE_ID_MISSING':'OFFICIAL_UPLOAD_JSON_INVALID',
+                  message:jsonParseSucceeded?'云端上传响应缺少文件编号':'云端上传响应为空或JSON被截断',
+                  httpStatus:xhr.status,readyState:xhr.readyState,responseLength:String(xhr.responseText || '').length,
+                  contentType:xhr.getResponseHeader('content-type') || '',jsonParseSucceeded,
+                  payloadCode:String(payload?.code ?? ''),
+                  dataKeys:Object.keys(payload?.data && typeof payload.data==='object'?payload.data:payload || {}),
+                  uploadAttempt,networkRetryCount:Math.max(0,uploadAttempt-1),elapsedMs:Date.now()-startedAt,timeoutMs:xhr.timeout,
+                },
+              }));
+              return;
+            }
+            settle(()=>resolve({fileId,ambiguous:false,diagnostic:null}));
           };
           const form = new FormData();
           form.append('parentFileID',String(params.parentFileID));
@@ -529,8 +756,6 @@
           form.append('file',blob,params.filename);
           xhr.timeout = Math.min(Math.max(120000,Math.ceil(blob.size/1024/1024)*10000),30*60*1000);
           xhr.send(form);
-        };
-        startAttempt();
       });
     }
 
@@ -557,47 +782,98 @@
       if (!stored || !(stored.blob instanceof Blob)) throw new Error('本地暂存文件已失效，请重新选择');
       const processed=await processArchive(stored,plan,text=>updateFileProgress(plan.bridgeId,text,5));
       const md5=await md5Blob(processed,text=>updateFileProgress(plan.bridgeId,text,10));
-      const params=await apiPost(
-        '/api/file-manage/direct-upload/prepare',
-        {sessionToken:state.sessionToken,bridgeId:plan.bridgeId,fileSize:processed.size,fileMd5:md5},
-        (count,delay)=>updateFileProgress(plan.bridgeId,retry522Text('上传准备服务',count,delay),10)
-      );
-      // AT 只在当前函数局部变量中使用；上传请求完成后立即清空引用。用户仍可通过
-      // 自己设备的网络调试工具看到请求头，这是当前“服务账号 AT 直发 H5”方案的既知边界。
-      let fileId=0;
-      try {
-        fileId=await uploadOfficial(processed,params,(text,progress)=>updateFileProgress(plan.bridgeId,text,10+Math.round(progress*.8)));
-      } finally {
-        // 无论上传成功还是网络异常，都尽快释放当前 AT 字符串引用。
-        params.accessToken='';
+      let lastError=null;
+      for(let uploadAttempt=1;uploadAttempt<=PAN123_UPLOAD_MAX_ATTEMPTS;uploadAttempt++) {
+        const params=await apiPostWhenReady(
+          '/api/file-manage/direct-upload/prepare',
+          {sessionToken:state.sessionToken,bridgeId:plan.bridgeId,fileSize:processed.size,fileMd5:md5},
+          text=>updateFileProgress(plan.bridgeId,text,10)
+        );
+        if(params.alreadyCompleted && params.result) {
+          updateFileProgress(plan.bridgeId,'上传完成',100);
+          await deleteStoredFile(plan.bridgeId);
+          return params.result;
+        }
+        let outcome;
+        try {
+          outcome=await uploadOfficial(
+            processed,
+            params,
+            (text,progress)=>updateFileProgress(plan.bridgeId,text,10+Math.round(progress*.8)),
+            uploadAttempt
+          );
+        } catch(error) {
+          void reportUploadError(plan,{
+            ...(error?.diagnostic || {}),
+            stage:error?.diagnostic?.stage || 'official_upload',errorCode:error?.code || 'OFFICIAL_UPLOAD_FAILED',message:error?.message,
+            uploadAttempt,networkRetryCount:uploadAttempt-1,
+          });
+          throw error;
+        } finally {
+          // 无论上传结果是否明确，都尽快释放当前服务账号 AT 字符串引用。
+          params.accessToken='';
+        }
+
+        try {
+          const result=await apiPostWhenReady(
+            '/api/file-manage/direct-upload/complete',
+            {sessionToken:state.sessionToken,bridgeId:plan.bridgeId,pan123FileId:outcome.fileId || null},
+            text=>updateFileProgress(plan.bridgeId,text,95)
+          );
+          if(outcome.diagnostic) {
+            void reportUploadError(plan,{...outcome.diagnostic,fallbackAttempted:true,fallbackSucceeded:true});
+          }
+          updateFileProgress(plan.bridgeId,'上传完成',100);
+          await deleteStoredFile(plan.bridgeId);
+          return result;
+        } catch(error) {
+          lastError=error;
+          if(outcome.diagnostic) {
+            void reportUploadError(plan,{
+              ...outcome.diagnostic,
+              message:`${outcome.diagnostic.message}；Server确认：${error?.message || '失败'}`,
+              fallbackAttempted:true,fallbackSucceeded:false,
+            });
+          }
+          const retryableConfirmation=Boolean(error?.retryable) || [
+            'PAN123_UPLOAD_NOT_VISIBLE','PAN123_UPLOAD_METADATA_MISMATCH'
+          ].includes(String(error?.code || ''));
+          if(outcome.ambiguous && retryableConfirmation && uploadAttempt<PAN123_UPLOAD_MAX_ATTEMPTS) {
+            const delayMs=retry522Delay(uploadAttempt);
+            updateFileProgress(
+              plan.bridgeId,
+              `服务器尚未确认远端文件，${Math.ceil(delayMs/1000)} 秒后重新获取上传参数（第 ${uploadAttempt+1} 次）`,
+              10
+            );
+            await wait(delayMs);
+            continue;
+          }
+          throw error;
+        }
       }
-      const result=await apiPost(
-        '/api/file-manage/direct-upload/complete',
-        {sessionToken:state.sessionToken,bridgeId:plan.bridgeId,pan123FileId:fileId},
-        (count,delay)=>updateFileProgress(plan.bridgeId,retry522Text('上传入库服务',count,delay),95)
-      );
-      updateFileProgress(plan.bridgeId,'上传完成',100);
-      await deleteStoredFile(plan.bridgeId);
-      return result;
+      throw lastError || new Error('云端上传多次确认失败');
     }
 
     async function runPool(items,worker,limit) {
       let next=0; const results=new Array(items.length);
-      const runners=Array.from({length:Math.min(limit,items.length)},async()=>{ while(next<items.length){const index=next++;try{results[index]={success:true,result:await worker(items[index])};}catch(error){results[index]={success:false,bridgeId:items[index].bridgeId,error:error instanceof Error?error.message:String(error)};updateFileProgress(items[index].bridgeId,results[index].error,0);}} });
+      const runners=Array.from({length:Math.min(limit,items.length)},async()=>{ while(next<items.length){const index=next++;try{results[index]={success:true,result:await worker(items[index])};}catch(error){results[index]={success:false,bridgeId:items[index].bridgeId,error:error instanceof Error?error.message:String(error)};void reportUploadError(items[index],{...(error?.diagnostic || {}),stage:error?.diagnostic?.stage || 'upload_flow',errorCode:error?.code || 'MANAGE_UPLOAD_FLOW_FAILED',message:results[index].error});updateFileProgress(items[index].bridgeId,results[index].error,0);}} });
       await Promise.all(runners); return results;
     }
 
     async function startUploadMode() {
       picker.classList.add('hidden'); actions.classList.add('hidden');
       intro.textContent='正在处理并上传文件，请保持页面开启。'; setStatus('正在读取上传计划...');
-      const manifest=await apiPost(
+      const manifest=await apiPostWhenReady(
         '/api/file-manage/direct-upload/status',
         {sessionToken:state.sessionToken},
-        (count,delay)=>setStatus(retry522Text('上传会话服务',count,delay))
+        text=>setStatus(text)
       );
       const completed=(manifest.files || [])
         .filter(item=>item.status==='completed' && item.result)
         .map(item=>({success:true,result:item.result}));
+      // 上一次上传可能已被 Server 确认成功，但页面在删除 IndexedDB Blob 前退出。
+      // 恢复会话时以 Server 完成事实为准批量结算本地副本，不能让它们一直等 24h TTL。
+      await deleteStoredFiles((manifest.files || []).filter(item=>item.status==='completed').map(item=>item.bridgeId));
       const plans=(manifest.files || []).filter(item=>item.status!=='completed');
       renderUploadFiles(plans);
       if (!plans.length) {
@@ -614,7 +890,7 @@
     }
 
     fileInput.addEventListener('change',event=>selectFiles(event.target.files).catch(error=>setStatus(error.message||String(error),true)));
-    clearButton.addEventListener('click',async()=>{for(const item of state.files)await deleteStoredFile(item.bridgeId);state.files=[];fileInput.value='';renderSelection();});
+    clearButton.addEventListener('click',async()=>{await deleteStoredFiles(state.files.map(item=>item.bridgeId));state.files=[];fileInput.value='';renderSelection();});
     confirmButton.addEventListener('click',()=>confirmSelection().catch(error=>setStatus(error.message||String(error),true)));
 
     async function boot() {

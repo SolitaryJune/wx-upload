@@ -328,7 +328,7 @@
           }
           await delay(50);
         } catch (error) {
-          console.error(`处理文件失败 [${file.name}]:`, error);
+          console.error('处理文件失败:', error instanceof Error ? error.name : 'UnknownError');
           failedCount++;
           failedFilesList.push(file.name);
         }
@@ -359,7 +359,7 @@
           postMiniProgramMessage({ type: 'chunkData', fileId, chunkIndex, totalChunks, data: chunkData });
           await delay(30);
         } catch (error) {
-          console.error(`分片 ${chunkIndex} 失败:`, error);
+          console.error(`分片 ${chunkIndex} 失败:`, error instanceof Error ? error.name : 'UnknownError');
           postMiniProgramMessage({ type: 'chunkError', fileId, error: error.message });
           return false;
         }

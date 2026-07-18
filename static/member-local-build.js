@@ -4,12 +4,29 @@
   const HTTP_522_STATUS = 522;
   const HTTP_522_RETRY_BASE_DELAY_MS = 800;
   const HTTP_522_RETRY_MAX_DELAY_MS = 8000;
+  const CONTROL_REQUEST_MAX_RETRIES = 8;
+  const INVALID_SERVER_RESPONSE_MAX_RETRIES = 3;
+  const PAN123_UPLOAD_MAX_ATTEMPTS = 3;
   const DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
   const BAIDU_TMP_UPLOAD_TIMEOUT_MS = 30 * 60 * 1000;
   const BAIDU_TMP_UPLOAD_MAX_ATTEMPTS = 3;
   const BAIDU_UPLOAD_CONFIRM_MAX_CYCLES = 3;
+  const FILE_WORKER_CONCURRENCY = 2;
+  const DOWNLOAD_CONCURRENCY = 2;
+  const HEAVY_PROCESS_CONCURRENCY = 1;
+  const PAN123_UPLOAD_CONCURRENCY = 2;
+  const BAIDU_UPLOAD_CONCURRENCY = 1;
+  const LEASE_RENEW_INTERVAL_MS = 60 * 1000;
+  const SESSION_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+  const BAIDU_UPLOAD_BLOCK_SIZE = 4 * 1024 * 1024;
   const AUDIO_PROCESS_MAX_BYTES = 24 * 1024 * 1024;
-  const FONT_WORKER_URL = './vendor/font-marker.worker.js?v=1';
+  const ARCHIVE_MAX_ENTRIES = 20000;
+  const ARCHIVE_MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024;
+  const ARCHIVE_MAX_COMPRESSION_RATIO = 300;
+  const MAX_FONT_WORKER_SOURCE_CHARS = 2 * 1024 * 1024;
+  // 自研 Worker 由独立资产网关解密返回；wx-upload 公开仓不再保存另一份明文副本。
+  // Worker 会从同一 Gateway 目录加载公开的 font-marker.vendor.js。
+  const FONT_WORKER_URL = 'https://tools.beautify.mp.juneover24.cn/font-marker-local/marker.worker.js';
   // 与小程序 api.ts 共用的算法兼容值会随客户端公开下发，不作为鉴权密钥使用。
   const FONT_STEGO_KEY = '24';
   const ARCHIVE_EXTENSIONS = new Set(['zip', 'bdi', 'bds', 'it', 'dibao']);
@@ -27,8 +44,20 @@
     sessionToken: '',
     manifest: null,
     sequence: 0,
-    currentLeaseId: '',
-    currentReleaseUrl: '',
+    tasks: new Map(),
+    downloadLeases: new Map(),
+    uploadLeases: new Map(),
+    abortControllers: new Set(),
+    xhrs: new Set(),
+    workers: new Set(),
+    fontWorkerScriptPromise: null,
+    fontWorkerBlobUrl: '',
+    failedFileKeys: new Set(),
+    paused: false,
+    cancelled: false,
+    processing: false,
+    overallProgress: 0,
+    sessionHeartbeat: 0,
     finished: false,
   };
 
@@ -36,6 +65,9 @@
   const statusEl = document.getElementById('status');
   const overallProgressEl = document.getElementById('overallProgress');
   const filesEl = document.getElementById('files');
+  const statsEl = document.getElementById('stats');
+  const retryButtonEl = document.getElementById('retryButton');
+  const cancelButtonEl = document.getElementById('cancelButton');
 
   class LocalUnsupportedError extends Error {
     constructor(message) {
@@ -62,6 +94,36 @@
     }
   }
 
+  function createSemaphore(limit) {
+    let active = 0;
+    const waiters = [];
+    const acquire = () => new Promise(resolve => {
+      if (active < limit) {
+        active += 1;
+        resolve();
+        return;
+      }
+      waiters.push(resolve);
+    });
+    const release = () => {
+      const next = waiters.shift();
+      if (next) next();
+      else active = Math.max(0, active - 1);
+    };
+    return {
+      async run(callback) {
+        await acquire();
+        try { return await callback(); }
+        finally { release(); }
+      },
+    };
+  }
+
+  const downloadSemaphore = createSemaphore(DOWNLOAD_CONCURRENCY);
+  const processSemaphore = createSemaphore(HEAVY_PROCESS_CONCURRENCY);
+  const pan123UploadSemaphore = createSemaphore(PAN123_UPLOAD_CONCURRENCY);
+  const baiduUploadSemaphore = createSemaphore(BAIDU_UPLOAD_CONCURRENCY);
+
   function parseHash() {
     const params = new URLSearchParams(location.hash.replace(/^#/, ''));
     const result = {};
@@ -86,6 +148,56 @@
     return `${label}连接超时，${Math.max(1, Math.ceil(delayMs / 1000))} 秒后重试（第 ${retryCount} 次）`;
   }
 
+  function createDiagnosticEventId() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    return `h5_${Date.now()}_${crypto.getRandomValues(new Uint32Array(2)).join('_')}`;
+  }
+
+  function sanitizeDiagnosticMessage(value) {
+    return String(value || '')
+      .replace(/https?:\/\/\S+\?\S+/gi, '[REDACTED_URL]')
+      .replace(/(access[_-]?token|authorization|session[_-]?token|upload[_-]?url)\s*[:=]\s*\S+/gi, '$1=[REDACTED]')
+      .slice(0, 500);
+  }
+
+  /**
+   * 诊断上报是旁路能力，绝不能成为文件流程的新失败点。只发送白名单元数据，
+   * Server 会从 sessionToken/fileKey 对应会话补齐可信 QQ、群和文件名。
+   */
+  function reportUploadError(plan, details) {
+    if (!state.sessionToken || !plan?.fileKey || !state.apiBase) return Promise.resolve();
+    const payload = {
+      sessionToken: state.sessionToken,
+      fileKey: plan.fileKey,
+      eventId: String(details.eventId || createDiagnosticEventId()),
+      stage: String(details.stage || 'upload').slice(0, 80),
+      errorCode: String(details.errorCode || 'H5_UPLOAD_ERROR').slice(0, 100),
+      provider: String(details.provider || 'pan123').slice(0, 20),
+      message: sanitizeDiagnosticMessage(details.message),
+      httpStatus: Number.isFinite(Number(details.httpStatus)) ? Number(details.httpStatus) : null,
+      readyState: Number.isFinite(Number(details.readyState)) ? Number(details.readyState) : null,
+      responseLength: Number.isFinite(Number(details.responseLength)) ? Number(details.responseLength) : null,
+      contentType: String(details.contentType || '').slice(0, 120),
+      jsonParseSucceeded: typeof details.jsonParseSucceeded === 'boolean' ? details.jsonParseSucceeded : null,
+      payloadCode: String(details.payloadCode ?? '').slice(0, 80),
+      dataKeys: Array.isArray(details.dataKeys) ? details.dataKeys.slice(0, 20).map(key => String(key).slice(0, 40)) : [],
+      uploadAttempt: Number.isFinite(Number(details.uploadAttempt)) ? Number(details.uploadAttempt) : null,
+      networkRetryCount: Number.isFinite(Number(details.networkRetryCount)) ? Number(details.networkRetryCount) : null,
+      elapsedMs: Number.isFinite(Number(details.elapsedMs)) ? Number(details.elapsedMs) : null,
+      timeoutMs: Number.isFinite(Number(details.timeoutMs)) ? Number(details.timeoutMs) : null,
+      fallbackAttempted: typeof details.fallbackAttempted === 'boolean' ? details.fallbackAttempted : null,
+      fallbackSucceeded: typeof details.fallbackSucceeded === 'boolean' ? details.fallbackSucceeded : null,
+    };
+    const url = `${state.apiBase}/api/member/local-build-h5/report-error`;
+    const body = JSON.stringify(payload);
+    return fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+      cache: 'no-store', credentials: 'omit', keepalive: true,
+    }).catch(() => {
+      try { navigator.sendBeacon?.(url, new Blob([body], { type: 'application/json' })); } catch (_) {}
+    }).then(() => undefined);
+  }
+
   async function fetchUntilNon522(url, options, onRetry) {
     let retryCount = 0;
     while (true) {
@@ -93,9 +205,15 @@
       try {
         response = await fetch(url, options);
       } catch (error) {
-        // CDN 522 错误页缺少 CORS 头时浏览器只能看到 TypeError。控制面和上传节点
-        // 均按同一退避规则重放，页面离开后浏览器会销毁等待任务。
+        if (state.cancelled || (error && error.name === 'AbortError')) throw error;
+        // CDN 522 错误页缺少 CORS 头时浏览器只能看到 TypeError。控制面使用有限
+        // 退避重放；达到上限后显式失败并进入诊断上报，避免页面永久等待。
         retryCount += 1;
+        if (retryCount > CONTROL_REQUEST_MAX_RETRIES) {
+          const exhausted = new Error('服务连接多次失败，请稍后重试');
+          exhausted.code = 'CONTROL_REQUEST_RETRY_EXHAUSTED';
+          throw exhausted;
+        }
         const delayMs = retry522Delay(retryCount);
         onRetry?.(retryCount, delayMs, error);
         await wait(delayMs);
@@ -103,6 +221,11 @@
       }
       if (response.status !== HTTP_522_STATUS) return response;
       retryCount += 1;
+      if (retryCount > CONTROL_REQUEST_MAX_RETRIES) {
+        const exhausted = new Error('服务节点持续超时，请稍后重试');
+        exhausted.code = 'CONTROL_REQUEST_RETRY_EXHAUSTED';
+        throw exhausted;
+      }
       const delayMs = retry522Delay(retryCount);
       try { await response.body?.cancel?.(); } catch (_) {}
       onRetry?.(retryCount, delayMs);
@@ -133,8 +256,25 @@
     statusEl.className = error ? 'status error' : 'status';
   }
 
+  function normalizeProgress(progress) {
+    if (progress === null || progress === undefined || progress === '') return null;
+    const value = Number(progress);
+    return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : null;
+  }
+
+  function monotonicProgress(previous, progress) {
+    const next = normalizeProgress(progress);
+    const current = normalizeProgress(previous) ?? 0;
+    return next === null ? current : Math.max(current, next);
+  }
+
   function setOverallProgress(progress) {
-    const value = Math.max(0, Math.min(100, Number(progress || 0)));
+    const next = normalizeProgress(progress);
+    if (next === null) return;
+    // 多文件会并发上报、上传也可能重试。总体进度只允许向前，避免较慢任务或
+    // Pan123 第二次上传把已经显示的进度从 96% 拉回 75%。
+    const value = monotonicProgress(state.overallProgress, next);
+    state.overallProgress = value;
     overallProgressEl.style.width = `${value}%`;
   }
 
@@ -158,7 +298,8 @@
   function unwrapApiData(payload, fallbackMessage) {
     if (!payload || typeof payload !== 'object') throw new Error(fallbackMessage || '服务器响应格式无效');
     const code = payload.code;
-    if (payload.success === false || ![undefined, null, 0, '0', 200, '200'].includes(code)) {
+    const explicitSuccess = payload.success === true || [0, '0', 200, '200'].includes(code);
+    if (payload.success === false || !explicitSuccess) {
       const detail = payload.detail;
       const message = typeof detail === 'object'
         ? detail.message
@@ -182,7 +323,20 @@
       },
       onRetry
     );
-    const payload = await response.json().catch(() => ({}));
+    const responseText = await response.text();
+    let payload;
+    try { payload = JSON.parse(responseText); }
+    catch (_) {
+      const error = new Error(`服务响应格式异常(${response.status})`);
+      error.statusCode = response.status;
+      error.code = 'SERVER_RESPONSE_INVALID';
+      error.diagnostic = {
+        eventId: createDiagnosticEventId(), stage: 'server_response', errorCode: 'SERVER_RESPONSE_INVALID',
+        message: error.message, httpStatus: response.status, responseLength: responseText.length,
+        contentType: response.headers.get('content-type') || '', jsonParseSucceeded: false, dataKeys: [],
+      };
+      throw error;
+    }
     if (!response.ok) {
       const detail = payload && payload.detail;
       const message = typeof detail === 'object'
@@ -190,10 +344,41 @@
         : (detail || payload.message || `接口响应异常(${response.status})`);
       const error = new Error(String(message));
       error.statusCode = response.status;
+      error.retryAfterSeconds = Math.max(
+        1,
+        Number(typeof detail === 'object' && detail.retryAfterSeconds || response.headers.get('retry-after') || 2)
+      );
       if (typeof detail === 'object' && detail.code) error.code = detail.code;
+      error.retryable = Boolean(typeof detail === 'object' && detail.retryable);
       throw error;
     }
     return unwrapApiData(payload, `接口响应异常(${response.status})`);
+  }
+
+  async function apiPostWhenReady(path, data, onWait) {
+    let invalidResponseRetries = 0;
+    while (true) {
+      if (state.cancelled) throw new DOMException('Aborted', 'AbortError');
+      try {
+        const result = await apiPost(path, data, (count, delay) => onWait?.(retry522Text('服务', count, delay)));
+        if (!result.pending) return result;
+        const delaySeconds = Math.max(1, Number(result.retryAfterSeconds || 2));
+        onWait?.('同一文件正在由服务器确认，稍后继续...');
+        await wait(delaySeconds * 1000);
+      } catch (error) {
+        if (error && error.code === 'SERVER_RESPONSE_INVALID' && invalidResponseRetries < INVALID_SERVER_RESPONSE_MAX_RETRIES) {
+          invalidResponseRetries += 1;
+          const delay = retry522Delay(invalidResponseRetries);
+          onWait?.(`服务响应不完整，${Math.ceil(delay / 1000)} 秒后重新确认`);
+          await wait(delay);
+          continue;
+        }
+        if (Number(error && error.statusCode || 0) !== 429) throw error;
+        const delaySeconds = Math.max(1, Number(error.retryAfterSeconds || 2));
+        onWait?.(error.message || '当前任务较多，正在等待空闲通道...');
+        await wait(delaySeconds * 1000);
+      }
+    }
   }
 
   function renderFiles(files) {
@@ -208,23 +393,40 @@
     });
   }
 
+  function updateStats() {
+    const tasks = Array.from(state.tasks.values());
+    const completed = tasks.filter(task => task.status === 'completed').length;
+    const delegated = tasks.filter(task => task.status === 'delegated').length;
+    const failed = tasks.filter(task => task.status === 'failed').length;
+    const active = tasks.filter(task => ['downloading', 'processing', 'uploading'].includes(task.status)).length;
+    if (statsEl) statsEl.textContent = `完成 ${completed} · 转服务器 ${delegated} · 处理中 ${active} · 失败 ${failed}`;
+    if (retryButtonEl) retryButtonEl.hidden = failed === 0 || state.processing;
+  }
+
+  function taskOverallProgress() {
+    const tasks = Array.from(state.tasks.values());
+    if (!tasks.length) return 0;
+    return Math.round(tasks.reduce((sum, task) => sum + Math.max(0, Math.min(100, Number(task.progress || 0))), 0) / tasks.length);
+  }
+
   function updateFileProgress(fileKey, text, progress, overallProgress) {
+    const task = state.tasks.get(String(fileKey || ''));
+    const requestedProgress = normalizeProgress(progress);
+    const displayedProgress = task && requestedProgress !== null
+      ? monotonicProgress(task.progress, requestedProgress)
+      : requestedProgress;
+    if (task && requestedProgress !== null) task.progress = displayedProgress;
     const row = filesEl.querySelector(`[data-file-key="${CSS.escape(String(fileKey || ''))}"]`);
     if (row) {
       row.querySelector('.file-meta').textContent = String(text || '正在处理');
-      if (Number.isFinite(Number(progress))) {
-        row.querySelector('.file-progress i').style.width = `${Math.max(0, Math.min(100, Number(progress)))}%`;
+      if (displayedProgress !== null) {
+        row.querySelector('.file-progress i').style.width = `${displayedProgress}%`;
       }
     }
-    if (Number.isFinite(Number(overallProgress))) setOverallProgress(overallProgress);
+    const requestedOverall = normalizeProgress(overallProgress);
+    setOverallProgress(requestedOverall === null ? taskOverallProgress() : requestedOverall);
     setStatus(text || '正在处理服务器下发文件...');
-    postMessage({
-      type: 'memberLocalBuildProgress',
-      fileKey: String(fileKey || ''),
-      text: String(text || '正在处理文件'),
-      progress: Number.isFinite(Number(progress)) ? Number(progress) : -1,
-      overallProgress: Number.isFinite(Number(overallProgress)) ? Number(overallProgress) : -1,
-    });
+    updateStats();
   }
 
   function overallForFile(fileIndex, fileCount, fileProgress) {
@@ -268,6 +470,7 @@
       size: Math.max(0, Number(data.size || 0)),
       leaseId,
       releaseUrl: new URL('/api/cloud-download/pan123-h5-download-slot/release', url).toString(),
+      renewUrl: new URL('/api/cloud-download/pan123-h5-download-slot/renew', url).toString(),
     };
   }
 
@@ -280,15 +483,50 @@
         const capacity = error.active > 0 ? `（${error.active}/${error.limit}）` : '';
         onWait?.(`当前下载人数较多，正在等待空闲通道${capacity}...`);
         await wait(error.retryAfterSeconds * 1000);
+        if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
       }
     }
   }
 
-  async function releaseDownloadSlot(keepalive = false) {
-    const leaseId = state.currentLeaseId;
-    const releaseUrl = state.currentReleaseUrl;
-    state.currentLeaseId = '';
-    state.currentReleaseUrl = '';
+  function registerController(controller) {
+    state.abortControllers.add(controller);
+    return controller;
+  }
+
+  function unregisterController(controller) {
+    state.abortControllers.delete(controller);
+  }
+
+  function trackDownloadLease(fileKey, credential) {
+    const key = String(fileKey || '');
+    const current = state.downloadLeases.get(key);
+    if (current && current.leaseId === credential.leaseId) return;
+    if (current) void releaseDownloadSlot(key);
+    const lease = {
+      leaseId: credential.leaseId,
+      releaseUrl: credential.releaseUrl,
+      renewUrl: credential.renewUrl,
+      timer: 0,
+    };
+    lease.timer = setInterval(() => {
+      void fetch(lease.renewUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ leaseId: lease.leaseId }),
+        cache: 'no-store',
+        credentials: 'omit',
+      }).catch(() => {});
+    }, LEASE_RENEW_INTERVAL_MS);
+    state.downloadLeases.set(key, lease);
+  }
+
+  async function releaseDownloadSlot(fileKey, keepalive = false) {
+    const key = String(fileKey || '');
+    const lease = state.downloadLeases.get(key);
+    state.downloadLeases.delete(key);
+    if (lease && lease.timer) clearInterval(lease.timer);
+    const leaseId = String(lease && lease.leaseId || '');
+    const releaseUrl = String(lease && lease.releaseUrl || '');
     if (!leaseId || !/^https:\/\//i.test(releaseUrl)) return;
     try {
       await fetch(releaseUrl, {
@@ -302,6 +540,69 @@
     } catch (_) {
       // Server 租约带 TTL；页面退出时释放失败会自动回收，不能反向覆盖已完成文件。
     }
+  }
+
+  function trackUploadLease(fileKey, leaseId) {
+    const key = String(fileKey || '');
+    if (!leaseId) return;
+    const current = state.uploadLeases.get(key);
+    if (current && current.leaseId === leaseId) return;
+    if (current) void releaseUploadSlot(key);
+    const lease = { leaseId: String(leaseId), timer: 0 };
+    lease.timer = setInterval(() => {
+      void fetch(`${state.apiBase}/api/member/local-build-h5/renew-upload-slot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionToken: state.sessionToken, fileKey: key, leaseId: lease.leaseId }),
+        cache: 'no-store',
+        credentials: 'omit',
+      }).catch(() => {});
+    }, LEASE_RENEW_INTERVAL_MS);
+    state.uploadLeases.set(key, lease);
+  }
+
+  async function releaseUploadSlot(fileKey, keepalive = false) {
+    const key = String(fileKey || '');
+    const lease = state.uploadLeases.get(key);
+    state.uploadLeases.delete(key);
+    if (lease && lease.timer) clearInterval(lease.timer);
+    if (!lease || !state.apiBase || !state.sessionToken) return;
+    try {
+      await fetch(`${state.apiBase}/api/member/local-build-h5/release-upload-slot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionToken: state.sessionToken, fileKey: key, leaseId: lease.leaseId }),
+        cache: 'no-store',
+        credentials: 'omit',
+        keepalive,
+      });
+    } catch (_) {}
+  }
+
+  async function releaseAllLeases(keepalive = false) {
+    await Promise.all([
+      ...Array.from(state.downloadLeases.keys()).map(key => releaseDownloadSlot(key, keepalive)),
+      ...Array.from(state.uploadLeases.keys()).map(key => releaseUploadSlot(key, keepalive)),
+    ]);
+  }
+
+  function startSessionHeartbeat() {
+    if (state.sessionHeartbeat) clearInterval(state.sessionHeartbeat);
+    state.sessionHeartbeat = setInterval(() => {
+      if (state.finished || state.cancelled || state.paused) return;
+      void fetch(`${state.apiBase}/api/member/local-build-h5/status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionToken: state.sessionToken }),
+        cache: 'no-store',
+        credentials: 'omit',
+      }).catch(() => {});
+    }, SESSION_HEARTBEAT_INTERVAL_MS);
+  }
+
+  function stopSessionHeartbeat() {
+    if (state.sessionHeartbeat) clearInterval(state.sessionHeartbeat);
+    state.sessionHeartbeat = 0;
   }
 
   async function fetchDownloadInfo(credential, signal) {
@@ -350,14 +651,22 @@
     const chunks = [];
     let received = 0;
     while (true) {
-      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (signal.aborted) {
+        try { await reader.cancel(); } catch (_) {}
+        throw new DOMException('Aborted', 'AbortError');
+      }
       const item = await reader.read();
       if (item.done) break;
       if (item.value && item.value.length) {
         received += item.value.length;
-        if (expectedSize > 0 && received > expectedSize) throw new Error('服务器下发文件超过预期大小');
+        if (expectedSize > 0 && received > expectedSize) {
+          try { await reader.cancel(); } catch (_) {}
+          throw new Error('服务器下发文件超过预期大小');
+        }
         chunks.push(item.value);
-        onProgress?.(expectedSize > 0 ? Math.round(received / expectedSize * 100) : 0, received, expectedSize);
+        // 未知总长度时只能报告已接收字节数，不能持续上报一个虚假的 0%。调用方
+        // 收到 null 后保留当前进度条，仅更新“已接收 xx MB”的阶段文案。
+        onProgress?.(expectedSize > 0 ? Math.round(received / expectedSize * 100) : null, received, expectedSize);
       }
     }
     if (expectedSize > 0 && received !== expectedSize) {
@@ -367,6 +676,10 @@
   }
 
   async function downloadSourceFile(plan, onProgress) {
+    return downloadSemaphore.run(() => downloadSourceFileWithSlot(plan, onProgress));
+  }
+
+  async function downloadSourceFileWithSlot(plan, onProgress) {
     const ticket = await apiPost(
       '/api/member/local-build-h5/download-ticket',
       { sessionToken: state.sessionToken, fileKey: plan.fileKey },
@@ -376,7 +689,7 @@
     const credentialTicket = String(ticket.credentialTicket || '').trim();
     if (!/^https:\/\//i.test(credentialUrl) || !credentialTicket) throw new Error('服务器下发文件参数无效');
 
-    const controller = new AbortController();
+    const controller = registerController(new AbortController());
     const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
     try {
       let credential = await exchangeCredentialWhenAvailable(
@@ -386,8 +699,7 @@
         controller.signal,
         text => onProgress(text, 0)
       );
-      state.currentLeaseId = credential.leaseId;
-      state.currentReleaseUrl = credential.releaseUrl;
+      trackDownloadLease(plan.fileKey, credential);
       let downloadInfo;
       try {
         downloadInfo = await fetchDownloadInfo(credential, controller.signal);
@@ -400,8 +712,7 @@
           controller.signal,
           text => onProgress(text, 0)
         );
-        state.currentLeaseId = credential.leaseId;
-        state.currentReleaseUrl = credential.releaseUrl;
+        trackDownloadLease(plan.fileKey, credential);
         downloadInfo = await fetchDownloadInfo(credential, controller.signal);
       }
       credential.accessToken = '';
@@ -424,11 +735,12 @@
         ),
         controller.signal
       );
-      await releaseDownloadSlot();
+      await releaseDownloadSlot(plan.fileKey);
       return blob;
     } finally {
       clearTimeout(timer);
-      await releaseDownloadSlot();
+      unregisterController(controller);
+      await releaseDownloadSlot(plan.fileKey);
     }
   }
 
@@ -458,14 +770,64 @@
     throw new LocalUnsupportedError('字体内容不是受支持的 TrueType/OpenType/TTC 容器');
   }
 
-  function markFontBuffer(buffer, filename, message) {
+  async function getFontWorkerScriptUrl() {
+    if (state.fontWorkerScriptPromise) return state.fontWorkerScriptPromise;
+    state.fontWorkerScriptPromise = (async () => {
+      const workerUrl = new URL(FONT_WORKER_URL, window.location.href);
+      if (workerUrl.origin === window.location.origin) return workerUrl.href;
+
+      // 浏览器禁止 Worker() 直接执行跨域 URL。分别通过 CORS 获取公开 vendor 和由
+      // Gateway 解密的自研段，再在当前页面创建 Blob Worker，避免把自研明文放回
+      // wx-upload 公开仓库。Worker 启动壳检测到 vendor 全局后不会再解析 blob: 相对路径。
+      const vendorUrl = new URL('./font-marker.vendor.js', workerUrl).href;
+      const controller = new AbortController();
+      state.abortControllers.add(controller);
+      try {
+        const responses = await Promise.all([vendorUrl, workerUrl.href].map(url => fetch(url, {
+          method: 'GET',
+          credentials: 'omit',
+          cache: 'no-cache',
+          redirect: 'follow',
+          signal: controller.signal,
+        })));
+        for (const response of responses) {
+          if (!response.ok) throw new LocalUnsupportedError(`字体 Worker 资源加载失败（HTTP ${response.status}）`);
+          const contentLength = Number(response.headers.get('content-length') || 0);
+          if (contentLength > MAX_FONT_WORKER_SOURCE_CHARS) {
+            throw new LocalUnsupportedError('字体 Worker 资源过大');
+          }
+        }
+        const sources = await Promise.all(responses.map(response => response.text()));
+        if (sources.some(source => source.length > MAX_FONT_WORKER_SOURCE_CHARS)) {
+          throw new LocalUnsupportedError('字体 Worker 资源过大');
+        }
+        state.fontWorkerBlobUrl = URL.createObjectURL(new Blob([
+          sources[0],
+          '\n',
+          sources[1],
+        ], { type: 'text/javascript' }));
+        return state.fontWorkerBlobUrl;
+      } finally {
+        state.abortControllers.delete(controller);
+      }
+    })().catch(error => {
+      state.fontWorkerScriptPromise = null;
+      throw error;
+    });
+    return state.fontWorkerScriptPromise;
+  }
+
+  async function markFontBuffer(buffer, filename, message) {
     inspectFontContainer(buffer);
+    const workerScriptUrl = await getFontWorkerScriptUrl();
     return new Promise((resolve, reject) => {
       let settled = false;
-      const worker = new Worker(FONT_WORKER_URL);
+      const worker = new Worker(workerScriptUrl);
+      state.workers.add(worker);
       const finish = (callback) => {
         if (settled) return;
         settled = true;
+        state.workers.delete(worker);
         worker.terminate();
         callback();
       };
@@ -478,14 +840,13 @@
         }
         finish(() => resolve(response.output));
       };
-      const transferable = buffer.slice(0);
       worker.postMessage({
         id: `font_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-        bytes: transferable,
+        bytes: buffer,
         filename,
         metadata: { message, marker: 'GuShao' },
         keyText: FONT_STEGO_KEY,
-      }, [transferable]);
+      }, [buffer]);
     });
   }
 
@@ -953,21 +1314,37 @@
       (parts.length > 0 && SYSTEM_NAMES.has(parts[parts.length - 1].toLowerCase()));
   }
 
-  function validateArchiveEntries(zip) {
+  function validateArchiveEntries(zip, compressedSize) {
     const normalized = new Set();
+    let fileCount = 0;
+    let totalUncompressed = 0;
     Object.entries(zip.files).forEach(([name, entry]) => {
       // JSZip 3 会把 ../ 从 entry.name 中净化，并把原始名称放在
       // unsafeOriginalName。安全检查必须优先看原始值，否则 ZipSlip 只会被悄悄改名。
       const originalName = entry.unsafeOriginalName || name;
       const clean = String(originalName || '').replace(/\\/g, '/');
       const parts = clean.split('/').filter(Boolean);
-      if (clean.startsWith('/') || parts.some(part => part === '..' || part.includes('\0'))) {
+      if (clean.startsWith('/') || /^[A-Za-z]:\//.test(clean) || parts.some(part => part === '..' || part.includes('\0'))) {
         throw new LocalUnsupportedError(`压缩包包含不安全路径：${name}`);
       }
       const key = parts.join('/').toLowerCase();
       if (key && normalized.has(key)) throw new LocalUnsupportedError(`压缩包包含重复路径：${name}`);
       if (key) normalized.add(key);
+      if (!entry.dir) {
+        fileCount += 1;
+        const entrySize = Math.max(0, Number(entry._data && entry._data.uncompressedSize || 0));
+        totalUncompressed += entrySize;
+      }
     });
+    if (fileCount > ARCHIVE_MAX_ENTRIES) {
+      throw new LocalUnsupportedError(`压缩包文件数量过多：${fileCount}`);
+    }
+    if (totalUncompressed > ARCHIVE_MAX_UNCOMPRESSED_BYTES) {
+      throw new LocalUnsupportedError(`压缩包解压后体积过大：${formatBytes(totalUncompressed)}`);
+    }
+    if (compressedSize > 0 && totalUncompressed / compressedSize > ARCHIVE_MAX_COMPRESSION_RATIO) {
+      throw new LocalUnsupportedError('压缩包压缩比异常，无法安全在浏览器处理');
+    }
   }
 
   function isEncryptedArchiveError(error) {
@@ -976,8 +1353,10 @@
 
   async function loadArchive(blob, label) {
     try {
-      const zip = await JSZip.loadAsync(blob, { checkCRC32: true, createFolders: true });
-      validateArchiveEntries(zip);
+      // checkCRC32 会在 load 阶段预解压所有条目，随后业务处理又解压一次，既慢又会让
+      // 压缩炸弹在中央目录预检前展开。这里先只读取目录并完成路径/体积/压缩比校验。
+      const zip = await JSZip.loadAsync(blob, { checkCRC32: false, createFolders: true });
+      validateArchiveEntries(zip, blob.size);
       return zip;
     } catch (error) {
       if (isEncryptedArchiveError(error)) throw new LocalUnsupportedError(`压缩包已加密，无法本地处理：${label}`);
@@ -1152,6 +1531,16 @@
     return new Blob([protectedBuffer], { type: 'application/octet-stream' });
   }
 
+  function mapBaseArchiveInnerProgress(index, innerCount, innerProgress) {
+    const count = Math.max(1, Number(innerCount || 0));
+    const safeIndex = Math.max(0, Math.min(count - 1, Number(index || 0)));
+    const safeInnerProgress = Math.max(0, Math.min(100, Number(innerProgress || 0)));
+    // 内层处理总共占外层进度的 0~80%。每个内层按自己的真实 PNG/字体/音效/
+    // 重打包进度占用一段，不能再用固定的 index + 0.5；单内层底包过去因此会在
+    // 整个重处理阶段长期停在 40%，映射到小程序总进度后表现为“卡 45/47”。
+    return Math.round(((safeIndex + safeInnerProgress / 100) / count) * 80);
+  }
+
   async function processBaseArchive(sourceBlob, plan, onProgress) {
     const outer = await loadArchive(sourceBlob, plan.sourceFileName);
     Object.keys(outer.files).forEach(path => { if (isSystemEntry(path)) outer.remove(path); });
@@ -1167,7 +1556,10 @@
       const processed = await processSkinArchiveBlob(await entry.async('blob'), innerPlan, {
         skipArchiveEncryption: true,
         modifyMaterials: false,
-        onProgress: text => onProgress(text, Math.round((index + 0.5) / innerEntries.length * 80)),
+        onProgress: (text, innerProgress) => onProgress(
+          text,
+          mapBaseArchiveInnerProgress(index, innerEntries.length, innerProgress)
+        ),
       });
       outer.file(entry.name, processed, { binary: true });
     }
@@ -1196,54 +1588,115 @@
     });
   }
 
-  async function md5Blob(blob, onProgress) {
-    const chunkSize = 4 * 1024 * 1024;
-    const chunks = Math.max(1, Math.ceil(blob.size / chunkSize));
-    const spark = new SparkMD5.ArrayBuffer();
+  async function digestBlobForUpload(blob, onProgress) {
+    const chunks = Math.max(1, Math.ceil(blob.size / BAIDU_UPLOAD_BLOCK_SIZE));
+    const wholeSpark = new SparkMD5.ArrayBuffer();
+    const blockMd5List = [];
     for (let index = 0; index < chunks; index++) {
-      spark.append(await blob.slice(index * chunkSize, Math.min(blob.size, (index + 1) * chunkSize)).arrayBuffer());
+      const buffer = await blob.slice(
+        index * BAIDU_UPLOAD_BLOCK_SIZE,
+        Math.min(blob.size, (index + 1) * BAIDU_UPLOAD_BLOCK_SIZE)
+      ).arrayBuffer();
+      wholeSpark.append(buffer);
+      const blockSpark = new SparkMD5.ArrayBuffer();
+      blockSpark.append(buffer);
+      blockMd5List.push(blockSpark.end());
       onProgress?.(`正在校验成品 ${index + 1}/${chunks}`, Math.round((index + 1) / chunks * 100));
       if (index % 4 === 3) await wait(0);
     }
-    return spark.end();
+    return { fileMd5: wholeSpark.end(), blockMd5List };
   }
 
-  function uploadPan123Official(blob, params, onProgress) {
-    return new Promise((resolve, reject) => {
-      let retryCount = 0;
-      const startAttempt = () => {
-        const xhr = new XMLHttpRequest();
-        let finished = false;
-        const retryNetwork = () => {
-          if (finished) return;
-          finished = true;
-          retryCount += 1;
-          const delay = retry522Delay(retryCount);
-          onProgress(retry522Text('网盘上传节点', retryCount, delay), 0);
-          setTimeout(startAttempt, delay);
-        };
+  function normalizeOfficialFileId(payload, responseText) {
+    const data = payload && payload.data && typeof payload.data === 'object' ? payload.data : payload;
+    const value = data && (data.fileID ?? data.fileId ?? data.file_id);
+    let text = String(value ?? '').trim();
+    if (typeof value === 'number' && !Number.isSafeInteger(value)) {
+      const match = String(responseText || '').match(/"(?:fileID|fileId|file_id)"\s*:\s*"?(\d+)"?/);
+      if (match) text = match[1];
+    }
+    if (!/^\d+$/.test(text)) return '';
+    text = text.replace(/^0+(?=\d)/, '');
+    return text !== '0' ? text : '';
+  }
+
+  function uploadPan123Official(fileKey, blob, params, onProgress, uploadAttempt) {
+    return pan123UploadSemaphore.run(() => new Promise((resolve, reject) => {
+      if (state.cancelled) { reject(new DOMException('Aborted', 'AbortError')); return; }
+      const xhr = new XMLHttpRequest();
+      const startedAt = Date.now();
+      state.xhrs.add(xhr);
+      let finished = false;
+      const settle = callback => {
+        if (finished) return;
+        finished = true;
+        state.xhrs.delete(xhr);
+        callback();
+      };
+      const ambiguous = (errorCode, message) => settle(() => resolve({
+        fileId: '',
+        ambiguous: true,
+        diagnostic: {
+          eventId: createDiagnosticEventId(), stage: 'official_upload', errorCode, message,
+          httpStatus: xhr.status, readyState: xhr.readyState, responseLength: String(xhr.responseText || '').length,
+          contentType: xhr.getResponseHeader('content-type') || '', jsonParseSucceeded: null,
+          payloadCode: '', dataKeys: [], uploadAttempt, networkRetryCount: Math.max(0, uploadAttempt - 1),
+          elapsedMs: Date.now() - startedAt, timeoutMs: xhr.timeout,
+        },
+      }));
         xhr.open('POST', params.uploadUrl, true);
         xhr.setRequestHeader('Authorization', `Bearer ${params.accessToken}`);
         xhr.setRequestHeader('Platform', 'open_platform');
         xhr.upload.onprogress = event => {
           if (event.lengthComputable) onProgress(`正在保存到您的网盘 ${Math.round(event.loaded / event.total * 100)}%`, Math.round(event.loaded / event.total * 100));
         };
-        xhr.onerror = retryNetwork;
-        xhr.ontimeout = retryNetwork;
+        xhr.onabort = () => settle(() => reject(new DOMException('Aborted', 'AbortError')));
+        xhr.onerror = () => ambiguous('OFFICIAL_UPLOAD_NETWORK_ERROR', '网盘上传连接中断，正在由服务器确认结果');
+        xhr.ontimeout = () => ambiguous('OFFICIAL_UPLOAD_TIMEOUT', '网盘上传等待超时，正在由服务器确认结果');
         xhr.onload = () => {
           if (finished) return;
-          if (xhr.status === HTTP_522_STATUS || xhr.status === 0) { retryNetwork(); return; }
-          finished = true;
-          let payload = {};
-          try { payload = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
-          if (xhr.status < 200 || xhr.status >= 300 || ![undefined, null, 0, '0', 200, '200'].includes(payload.code)) {
-            reject(new Error(payload.message || payload.msg || `网盘上传失败(${xhr.status})`));
+          if (xhr.status === HTTP_522_STATUS || xhr.status === 0 || xhr.status >= 500) {
+            ambiguous(`OFFICIAL_UPLOAD_HTTP_${xhr.status || 0}`, `网盘上传节点响应异常(${xhr.status || 0})，正在由服务器确认结果`);
             return;
           }
-          const data = payload.data || payload;
-          const fileId = Number(data.fileID || data.fileId || data.file_id || 0);
-          if (!Number.isFinite(fileId) || fileId <= 0) { reject(new Error('网盘上传响应缺少文件编号')); return; }
-          resolve(Math.floor(fileId));
+          let payload;
+          let jsonParseSucceeded = true;
+          try { payload = JSON.parse(xhr.responseText); }
+          catch (_) { payload = {}; jsonParseSucceeded = false; }
+          if (xhr.status < 200 || xhr.status >= 300 || ![undefined, null, 0, '0', 200, '200'].includes(payload.code)) {
+            const error = new Error(payload.message || payload.msg || `网盘上传失败(${xhr.status})`);
+            error.code = `OFFICIAL_UPLOAD_HTTP_${xhr.status}`;
+            error.diagnostic = {
+              eventId: createDiagnosticEventId(), stage: 'official_upload_response', errorCode: error.code, message: error.message,
+              httpStatus: xhr.status, readyState: xhr.readyState, responseLength: String(xhr.responseText || '').length,
+              contentType: xhr.getResponseHeader('content-type') || '', jsonParseSucceeded,
+              payloadCode: String((payload && payload.code) ?? ''),
+              dataKeys: Object.keys(payload && payload.data && typeof payload.data === 'object' ? payload.data : payload || {}),
+              uploadAttempt, networkRetryCount: Math.max(0, uploadAttempt - 1),
+              elapsedMs: Date.now() - startedAt, timeoutMs: xhr.timeout,
+            };
+            settle(() => reject(error));
+            return;
+          }
+          const fileId = normalizeOfficialFileId(payload, xhr.responseText);
+          if (!fileId) {
+            settle(() => resolve({
+              fileId: '', ambiguous: true,
+              diagnostic: {
+                eventId: createDiagnosticEventId(), stage: 'official_upload_response',
+                errorCode: jsonParseSucceeded ? 'OFFICIAL_UPLOAD_FILE_ID_MISSING' : 'OFFICIAL_UPLOAD_JSON_INVALID',
+                message: jsonParseSucceeded ? '网盘上传响应缺少文件编号' : '网盘上传响应为空或JSON被截断',
+                httpStatus: xhr.status, readyState: xhr.readyState, responseLength: String(xhr.responseText || '').length,
+                contentType: xhr.getResponseHeader('content-type') || '', jsonParseSucceeded,
+                payloadCode: String((payload && payload.code) ?? ''),
+                dataKeys: Object.keys(payload && payload.data && typeof payload.data === 'object' ? payload.data : payload || {}),
+                uploadAttempt, networkRetryCount: Math.max(0, uploadAttempt - 1),
+                elapsedMs: Date.now() - startedAt, timeoutMs: xhr.timeout,
+              },
+            }));
+            return;
+          }
+          settle(() => resolve({ fileId, ambiguous: false, diagnostic: null }));
         };
         const form = new FormData();
         form.append('parentFileID', String(params.parentFileID));
@@ -1254,9 +1707,7 @@
         form.append('file', blob, params.filename);
         xhr.timeout = Math.min(Math.max(120000, Math.ceil(blob.size / 1024 / 1024) * 10000), 30 * 60 * 1000);
         xhr.send(form);
-      };
-      startAttempt();
-    });
+    }));
   }
 
   function isRetryableUploadConfirmError(error) {
@@ -1264,20 +1715,19 @@
     return statusCode === 0 || statusCode === 408 || statusCode === 429 || statusCode >= 500;
   }
 
-  async function uploadBaiduTmp(blob, filename, uploadUrl, onProgress) {
+  async function uploadBaiduPart(blob, filename, part, completedBytes, totalUploadBytes, onProgress) {
     let lastError = null;
     for (let attempt = 1; attempt <= BAIDU_TMP_UPLOAD_MAX_ATTEMPTS; attempt++) {
-      const controller = window.AbortController ? new AbortController() : null;
-      const timeoutId = controller
-        ? setTimeout(() => controller.abort(), BAIDU_TMP_UPLOAD_TIMEOUT_MS)
-        : 0;
+      const controller = window.AbortController ? registerController(new AbortController()) : null;
+      const timeoutId = controller ? setTimeout(() => controller.abort(), BAIDU_TMP_UPLOAD_TIMEOUT_MS) : 0;
       try {
-        // no-cors 响应是 opaque，浏览器无法读取百度返回的 HTTP 状态。这里仅表示请求
-        // 已完成发送，不能据此判定上传成功；真正的成功事实由后续 Server create 确认。
+        // no-cors 响应是 opaque，浏览器无法读取百度返回的 HTTP 状态。每个 4MB 分片
+        // 完成发送后仍需 Server create 才能成为成功事实。
         const form = new FormData();
         form.append('file', blob, filename);
-        onProgress(`正在保存到百度网盘（上传文件体 ${attempt}/${BAIDU_TMP_UPLOAD_MAX_ATTEMPTS}）`, 35);
-        await fetch(uploadUrl, {
+        const percent = Math.round(completedBytes / Math.max(1, totalUploadBytes) * 100);
+        onProgress(`正在保存到百度网盘（分片 ${Number(part.partseq) + 1}，尝试 ${attempt}）`, percent);
+        await fetch(part.uploadUrl, {
           method: 'POST',
           mode: 'no-cors',
           body: form,
@@ -1286,36 +1736,60 @@
         return;
       } catch (error) {
         lastError = error;
+        if (state.cancelled || (error && error.name === 'AbortError' && !timeoutId)) throw error;
         if (attempt >= BAIDU_TMP_UPLOAD_MAX_ATTEMPTS) break;
         const delay = Math.min(8000, 1500 * Math.pow(2, attempt - 1));
-        onProgress(`百度网盘文件体上传中断，${Math.ceil(delay / 1000)} 秒后重试`, 35);
+        onProgress(`百度网盘分片上传中断，${Math.ceil(delay / 1000)} 秒后重试`, 0);
         await wait(delay);
       } finally {
         if (timeoutId) clearTimeout(timeoutId);
+        if (controller) unregisterController(controller);
       }
     }
-    if (lastError && lastError.name === 'AbortError') {
-      throw new Error('百度网盘文件体上传超时');
-    }
-    throw lastError || new Error('百度网盘文件体上传失败');
+    if (lastError && lastError.name === 'AbortError') throw new Error('百度网盘分片上传超时');
+    throw lastError || new Error('百度网盘分片上传失败');
+  }
+
+  async function uploadBaiduTmp(blob, filename, uploadParts, onProgress) {
+    return baiduUploadSemaphore.run(async () => {
+      const parts = Array.isArray(uploadParts) ? uploadParts : [];
+      if (!parts.length) throw new Error('百度网盘预上传响应缺少分片地址');
+      const totalUploadBytes = parts.reduce((sum, part) => {
+        const offset = Math.max(0, Number(part.partseq || 0)) * BAIDU_UPLOAD_BLOCK_SIZE;
+        return sum + Math.max(0, Math.min(blob.size, offset + BAIDU_UPLOAD_BLOCK_SIZE) - offset);
+      }, 0);
+      let completedBytes = 0;
+      for (const part of parts) {
+        const partseq = Math.max(0, Number(part.partseq || 0));
+        const start = partseq * BAIDU_UPLOAD_BLOCK_SIZE;
+        const end = Math.min(blob.size, start + BAIDU_UPLOAD_BLOCK_SIZE);
+        if (start >= end || !part.uploadUrl) throw new Error('百度网盘分片参数无效');
+        const partBlob = blob.slice(start, end);
+        await uploadBaiduPart(partBlob, filename, part, completedBytes, totalUploadBytes, onProgress);
+        completedBytes += partBlob.size;
+        onProgress(`正在保存到百度网盘 ${Math.round(completedBytes / Math.max(1, totalUploadBytes) * 100)}%`, Math.round(completedBytes / Math.max(1, totalUploadBytes) * 100));
+      }
+    });
   }
 
   async function completeBaiduUpload(blob, plan, upload, onProgress) {
-    const complete = () => apiPost(
+    const complete = () => apiPostWhenReady(
       '/api/member/local-build-h5/complete-upload',
       { sessionToken: state.sessionToken, fileKey: plan.fileKey },
-      (count, delay) => onProgress(retry522Text('百度上传结果服务', count, delay), 96)
+      text => onProgress(text, 96)
     );
 
     if (upload.reuse && Number(upload.fsId || 0) > 0) {
       onProgress('正在确认百度网盘秒传结果...', 96);
       return complete();
     }
-    if (!upload.uploadUrl) throw new Error('百度网盘预上传响应缺少上传地址');
+    if (!Array.isArray(upload.uploadParts) || upload.uploadParts.length === 0) {
+      throw new Error('百度网盘预上传响应缺少分片地址');
+    }
 
     let lastError = null;
     for (let cycle = 1; cycle <= BAIDU_UPLOAD_CONFIRM_MAX_CYCLES; cycle++) {
-      await uploadBaiduTmp(blob, upload.filename || plan.outputFileName, upload.uploadUrl, (text, value) => {
+      await uploadBaiduTmp(blob, upload.filename || plan.outputFileName, upload.uploadParts, (text, value) => {
         onProgress(text, 75 + Math.round(Number(value || 0) * 0.2));
       });
       try {
@@ -1336,69 +1810,313 @@
     throw lastError || new Error('百度网盘上传确认失败');
   }
 
-  async function processOne(plan, fileIndex, fileCount) {
-    const progress = (text, value) => updateFileProgress(plan.fileKey, text, value, overallForFile(fileIndex, fileCount, value));
-    progress('正在获取服务器下发文件计划...', 0);
-    const source = await downloadSourceFile(plan, (text, value) => progress(text, Math.round(Number(value || 0) * 0.3)));
-    progress('正在浏览器本地处理...', 32);
-    const processed = await processDownloadedBlob(source, plan, (text, value) => progress(text, 32 + Math.round(Number(value || 0) * 0.38)));
-    const md5 = await md5Blob(processed, (text, value) => progress(text, 70 + Math.round(Number(value || 0) * 0.05)));
-    const upload = await apiPost(
-      '/api/member/local-build-h5/prepare-upload',
-      { sessionToken: state.sessionToken, fileKey: plan.fileKey, fileSize: processed.size, fileMd5: md5 },
-      (count, delay) => progress(retry522Text('上传准备服务', count, delay), 75)
+  async function deferUnsupportedFile(task, error) {
+    const plan = task.plan;
+    const result = await apiPostWhenReady(
+      '/api/member/local-build-h5/defer-file',
+      {
+        sessionToken: state.sessionToken,
+        fileKey: plan.fileKey,
+        reason: String(error && error.code || 'local_unsupported').toLowerCase(),
+        message: String(error && error.message || '浏览器无法处理当前文件'),
+      },
+      text => updateFileProgress(plan.fileKey, text, task.progress)
     );
-    const provider = String(upload.provider || state.manifest.destinationProvider || '').trim();
-    if (provider === 'baidu') {
-      await completeBaiduUpload(processed, plan, upload, (text, value) => progress(text, value));
-    } else if (provider === 'pan123') {
-      let fileId = 0;
-      try {
-        fileId = await uploadPan123Official(
-          processed,
-          upload,
-          (text, value) => progress(text, 75 + Math.round(Number(value || 0) * 0.2))
-        );
-      } finally {
-        // AT 只在当前函数的 prepare 响应中短暂使用，上传结束立即清空引用。
-        upload.accessToken = '';
-      }
-      await apiPost(
-        '/api/member/local-build-h5/complete-upload',
-        { sessionToken: state.sessionToken, fileKey: plan.fileKey, pan123FileId: fileId },
-        (count, delay) => progress(retry522Text('上传结果服务', count, delay), 96)
-      );
-    } else {
-      throw new Error('本地构建目标网盘无效');
-    }
-    progress('文件处理完成', 100);
+    task.status = 'delegated';
+    task.error = '';
+    task.progress = 100;
+    state.failedFileKeys.delete(plan.fileKey);
+    updateFileProgress(plan.fileKey, `已转服务器处理：${result.message || error.message}`, 100);
   }
 
-  async function abortSession() {
-    return apiPost('/api/member/local-build-h5/abort', { sessionToken: state.sessionToken });
-  }
-
-  async function fail(error) {
-    const message = error instanceof Error ? error.message : String(error || '处理失败');
-    let fallbackAllowed = false;
-    const isLocalUnsupported = error instanceof LocalUnsupportedError || (error && error.code === 'LOCAL_UNSUPPORTED');
+  async function processOne(task) {
+    const plan = task.plan;
+    const progress = (text, value, stage) => {
+      if (stage) task.status = stage;
+      updateFileProgress(plan.fileKey, text, value);
+    };
     try {
-      const aborted = await abortSession();
-      fallbackAllowed = isLocalUnsupported && aborted.cleaned === true;
-    } catch (_) {
-      fallbackAllowed = false;
+      task.error = '';
+      state.failedFileKeys.delete(plan.fileKey);
+      progress('正在获取服务器下发文件计划...', 0, 'downloading');
+      const source = await downloadSourceFile(plan, (text, value) => {
+        const downloadProgress = normalizeProgress(value);
+        progress(text, downloadProgress === null ? null : Math.round(downloadProgress * 0.3), 'downloading');
+      });
+      progress('正在浏览器本地处理...', 32, 'processing');
+      const processed = await processSemaphore.run(() => processDownloadedBlob(
+        source,
+        plan,
+        (text, value) => progress(text, 32 + Math.round(Number(value || 0) * 0.38), 'processing')
+      ));
+      const digest = await digestBlobForUpload(
+        processed,
+        (text, value) => progress(text, 70 + Math.round(Number(value || 0) * 0.05), 'processing')
+      );
+      const prepareUpload = () => apiPostWhenReady(
+        '/api/member/local-build-h5/prepare-upload', {
+          sessionToken: state.sessionToken,
+          fileKey: plan.fileKey,
+          fileSize: processed.size,
+          fileMd5: digest.fileMd5,
+          blockMd5List: digest.blockMd5List,
+        }, text => progress(text, 75, 'uploading')
+      );
+      const upload = await prepareUpload();
+      if (upload.alreadyCompleted) {
+        task.status = 'completed';
+        task.progress = 100;
+        progress('文件处理完成', 100, 'completed');
+        return;
+      }
+      trackUploadLease(plan.fileKey, upload.uploadLeaseId);
+      const provider = String(upload.provider || state.manifest.destinationProvider || '').trim();
+      progress('正在等待网盘上传通道...', 75, 'uploading');
+      if (provider === 'baidu') {
+        await completeBaiduUpload(processed, plan, upload, (text, value) => progress(text, value, 'uploading'));
+      } else if (provider === 'pan123') {
+        let currentUpload = upload;
+        let lastConfirmationError = null;
+        for (let uploadAttempt = 1; uploadAttempt <= PAN123_UPLOAD_MAX_ATTEMPTS; uploadAttempt++) {
+          let outcome;
+          try {
+            outcome = await uploadPan123Official(
+              plan.fileKey,
+              processed,
+              currentUpload,
+              (text, value) => progress(text, 75 + Math.round(Number(value || 0) * 0.2), 'uploading'),
+              uploadAttempt
+            );
+          } catch (error) {
+            void reportUploadError(plan, {
+              ...(error && error.diagnostic || {}),
+              stage: error && error.diagnostic && error.diagnostic.stage || 'official_upload',
+              errorCode: error && error.code || 'OFFICIAL_UPLOAD_FAILED',
+              message: error && error.message, uploadAttempt, networkRetryCount: uploadAttempt - 1,
+            });
+            throw error;
+          } finally {
+            // 每次 prepare 返回的 AT 只服务当前上传尝试，结束后立即清空引用。
+            currentUpload.accessToken = '';
+          }
+
+          try {
+            await apiPostWhenReady(
+              '/api/member/local-build-h5/complete-upload',
+              { sessionToken: state.sessionToken, fileKey: plan.fileKey, pan123FileId: outcome.fileId || null },
+              text => progress(text, 96, 'uploading')
+            );
+            if (outcome.diagnostic) {
+              void reportUploadError(plan, { ...outcome.diagnostic, fallbackAttempted: true, fallbackSucceeded: true });
+            }
+            lastConfirmationError = null;
+            break;
+          } catch (error) {
+            lastConfirmationError = error;
+            if (outcome.diagnostic) {
+              void reportUploadError(plan, {
+                ...outcome.diagnostic,
+                message: `${outcome.diagnostic.message}；Server确认：${error && error.message || '失败'}`,
+                fallbackAttempted: true,
+                fallbackSucceeded: false,
+              });
+            }
+            const retryableConfirmation = Boolean(error && error.retryable) || [
+              'PAN123_UPLOAD_NOT_VISIBLE', 'PAN123_UPLOAD_METADATA_MISMATCH'
+            ].includes(String(error && error.code || ''));
+            if (!outcome.ambiguous || !retryableConfirmation || uploadAttempt >= PAN123_UPLOAD_MAX_ATTEMPTS) {
+              throw error;
+            }
+            const delay = retry522Delay(uploadAttempt);
+            progress(
+              `服务器尚未确认远端文件，${Math.ceil(delay / 1000)} 秒后重新获取上传参数（第 ${uploadAttempt + 1} 次）`,
+              75,
+              'uploading'
+            );
+            await wait(delay);
+            currentUpload = await prepareUpload();
+            if (currentUpload.alreadyCompleted) {
+              lastConfirmationError = null;
+              break;
+            }
+            trackUploadLease(plan.fileKey, currentUpload.uploadLeaseId);
+          }
+        }
+        if (lastConfirmationError) throw lastConfirmationError;
+      } else {
+        throw new Error('本地构建目标网盘无效');
+      }
+      task.status = 'completed';
+      task.progress = 100;
+      progress('文件处理完成', 100, 'completed');
+    } catch (error) {
+      if (state.cancelled) throw error;
+      const isLocalUnsupported = error instanceof LocalUnsupportedError || (error && error.code === 'LOCAL_UNSUPPORTED');
+      if (isLocalUnsupported) {
+        try {
+          await deferUnsupportedFile(task, error);
+          return;
+        } catch (deferError) {
+          error = deferError;
+        }
+      }
+      task.status = 'failed';
+      task.error = String(error && error.message || '文件处理失败');
+      void reportUploadError(plan, {
+        ...(error && error.diagnostic || {}),
+        stage: error && error.diagnostic && error.diagnostic.stage || String(task.status || 'upload_flow'),
+        errorCode: error && error.code || 'MEMBER_UPLOAD_FLOW_FAILED',
+        provider: String(state.manifest && state.manifest.destinationProvider || 'pan123'),
+        message: task.error,
+      });
+      state.failedFileKeys.add(plan.fileKey);
+      updateFileProgress(plan.fileKey, `处理失败：${task.error}`, task.progress);
+      const row = filesEl.querySelector(`[data-file-key="${CSS.escape(String(plan.fileKey || ''))}"]`);
+      if (row) row.classList.add('failed');
+    } finally {
+      await releaseDownloadSlot(plan.fileKey);
+      await releaseUploadSlot(plan.fileKey);
+      updateStats();
     }
+  }
+
+  const resumeWaiters = [];
+
+  function setPaused(paused) {
+    if (state.cancelled || state.finished) return;
+    const next = !!paused;
+    if (state.paused === next) return;
+    state.paused = next;
+    if (next) {
+      setStatus('页面已进入后台，当前任务可继续收尾，暂不领取新文件。');
+      return;
+    }
+    while (resumeWaiters.length) resumeWaiters.shift()();
+    if (state.sessionToken && state.apiBase && !state.finished) startSessionHeartbeat();
+    setStatus('页面已恢复，继续处理服务器下发文件...');
+  }
+
+  async function waitUntilActive() {
+    while (state.paused && !state.cancelled) {
+      await new Promise(resolve => resumeWaiters.push(resolve));
+    }
+    if (state.cancelled) throw new DOMException('Aborted', 'AbortError');
+  }
+
+  async function finalizeWhenReady() {
+    setStatus('正在整理交付目录...');
+    const result = await apiPostWhenReady(
+      '/api/member/local-build-h5/finalize',
+      { sessionToken: state.sessionToken },
+      text => setStatus(text)
+    );
     state.finished = true;
-    setStatus(message, true);
+    stopSessionHeartbeat();
+    setOverallProgress(100);
+    setStatus('服务器下发文件处理完成，正在返回会员专区...');
+    postMessage({
+      type: 'memberLocalBuildResult',
+      complete: true,
+      success: true,
+      taskId: result.taskId,
+      provider: result.provider || state.manifest.destinationProvider,
+      folderId: result.folderId,
+      remoteFolderId: result.remoteFolderId,
+      folderPath: result.folderPath,
+      fileCount: result.fileCount,
+      fallbackFiles: Array.isArray(result.fallbackFiles) ? result.fallbackFiles : [],
+    });
+    navigateBack();
+  }
+
+  async function runTasks(fileKeys) {
+    if (state.processing || state.finished || state.cancelled) return;
+    const queue = (fileKeys || []).map(key => state.tasks.get(String(key))).filter(Boolean);
+    if (!queue.length) {
+      await finalizeWhenReady();
+      return;
+    }
+    state.processing = true;
+    if (retryButtonEl) retryButtonEl.hidden = true;
+    let cursor = 0;
+    try {
+      const workerCount = Math.min(FILE_WORKER_CONCURRENCY, queue.length);
+      await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (true) {
+          await waitUntilActive();
+          const index = cursor;
+          cursor += 1;
+          if (index >= queue.length) return;
+          await processOne(queue[index]);
+        }
+      }));
+    } finally {
+      state.processing = false;
+      updateStats();
+    }
+    if (state.cancelled) return;
+    if (state.failedFileKeys.size > 0) {
+      setStatus(`有 ${state.failedFileKeys.size} 个文件处理失败，可点击“重试失败项”继续。`, true);
+      if (retryButtonEl) retryButtonEl.hidden = false;
+      return;
+    }
+    await finalizeWhenReady();
+  }
+
+  function abortActiveResources() {
+    state.abortControllers.forEach(controller => { try { controller.abort(); } catch (_) {} });
+    state.xhrs.forEach(xhr => { try { xhr.abort(); } catch (_) {} });
+    state.workers.forEach(worker => { try { worker.terminate(); } catch (_) {} });
+    state.abortControllers.clear();
+    state.xhrs.clear();
+    state.workers.clear();
+    if (state.fontWorkerBlobUrl) {
+      URL.revokeObjectURL(state.fontWorkerBlobUrl);
+      state.fontWorkerBlobUrl = '';
+      state.fontWorkerScriptPromise = null;
+    }
+  }
+
+  async function cancelSession() {
+    if (state.finished || state.cancelled) return;
+    state.cancelled = true;
+    stopSessionHeartbeat();
+    setStatus('正在取消并清理临时文件...');
+    abortActiveResources();
+    while (resumeWaiters.length) resumeWaiters.shift()();
+    await releaseAllLeases(true);
+    try {
+      // state.cancelled 会阻止普通控制面重试继续占用资源，因此取消接口使用独立的
+      // keepalive 小请求；失败时 Server 仍会按会话 hard TTL 回收。
+      await fetch(`${state.apiBase}/api/member/local-build-h5/abort`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionToken: state.sessionToken }),
+        cache: 'no-store',
+        credentials: 'omit',
+        keepalive: true,
+      });
+    } catch (_) {}
+    state.finished = true;
     postMessage({
       type: 'memberLocalBuildResult',
       complete: true,
       success: false,
-      code: error && error.code || (isLocalUnsupported ? 'LOCAL_UNSUPPORTED' : 'PROCESS_FAILED'),
-      fallbackAllowed,
-      error: message,
+      code: 'CANCELLED',
+      fallbackAllowed: false,
+      error: '服务器下发文件处理已取消',
     });
     navigateBack();
+  }
+
+  async function failStartup(error) {
+    // cancelSession 已经拥有取消态的状态文案、结果消息和返回流程。主动 abort
+    // 产生的 AbortError（或并发任务随后抛出的错误）不能再由顶层 catch 覆盖它。
+    if (state.cancelled) return;
+    const message = error instanceof Error ? error.message : String(error || '处理失败');
+    stopSessionHeartbeat();
+    setStatus(message, true);
+    if (cancelButtonEl) cancelButtonEl.disabled = false;
   }
 
   async function start() {
@@ -1415,60 +2133,63 @@
       (count, delay) => setStatus(retry522Text('文件会话服务', count, delay))
     );
     state.manifest = manifest;
+    startSessionHeartbeat();
+    if (String(manifest.status || '') === 'aborted') throw new Error('服务器下发文件会话已取消，请重新发起');
     const destinationProvider = String(manifest.destinationProvider || '').trim();
-    if (!['pan123', 'baidu'].includes(destinationProvider)) {
-      throw new Error('服务器下发文件目标网盘无效');
-    }
-    const completed = (manifest.files || []).filter(item => item.status === 'completed');
-    const plans = (manifest.files || []).filter(item => item.status !== 'completed');
+    if (!['pan123', 'baidu'].includes(destinationProvider)) throw new Error('服务器下发文件目标网盘无效');
+
+    const files = Array.isArray(manifest.files) ? manifest.files : [];
+    renderFiles(files);
+    files.forEach(plan => {
+      const status = plan.status === 'completed' ? 'completed' : (plan.status === 'delegated' ? 'delegated' : 'pending');
+      const task = { plan, status, progress: status === 'pending' ? 0 : 100, error: '' };
+      state.tasks.set(String(plan.fileKey), task);
+      if (status === 'completed') updateFileProgress(plan.fileKey, '已完成', 100);
+      else if (status === 'delegated') updateFileProgress(plan.fileKey, '已转服务器处理', 100);
+    });
     const fallbackCount = Math.max(0, Number(manifest.fallbackCount || 0));
     summaryEl.textContent = fallbackCount > 0
-      ? `本地构建 ${manifest.files.length} 个文件并保存到目标网盘；另有 ${fallbackCount} 个不支持文件将在返回小程序后单独提交服务器处理。`
-      : `共 ${manifest.files.length} 个文件，浏览器将依次处理并保存到您的目标网盘。`;
-    renderFiles(manifest.files || []);
-    completed.forEach(item => updateFileProgress(item.fileKey, '已完成', 100, 0));
-
-    for (let index = 0; index < plans.length; index++) {
-      await processOne(plans[index], completed.length + index, manifest.files.length);
-    }
-    setStatus('正在整理交付目录...');
-    const result = await apiPost(
-      '/api/member/local-build-h5/finalize',
-      { sessionToken: state.sessionToken },
-      (count, delay) => setStatus(retry522Text('交付目录服务', count, delay))
+      ? `本地处理 ${files.length} 个文件；另有 ${fallbackCount} 个文件将在返回小程序后交给服务器。`
+      : `共 ${files.length} 个文件，将分阶段并发处理并保存到您的目标网盘。`;
+    updateStats();
+    await runTasks(
+      files.filter(item => !['completed', 'delegated'].includes(String(item.status || ''))).map(item => item.fileKey)
     );
-    state.finished = true;
-    setOverallProgress(100);
-    setStatus('服务器下发文件处理完成，正在返回会员专区...');
-    postMessage({
-      type: 'memberLocalBuildResult',
-      complete: true,
-      success: true,
-      taskId: result.taskId,
-      provider: result.provider || destinationProvider,
-      folderId: result.folderId,
-      remoteFolderId: result.remoteFolderId,
-      folderPath: result.folderPath,
-      fileCount: result.fileCount,
-    });
-    navigateBack();
   }
 
+  document.addEventListener('visibilitychange', () => setPaused(document.visibilityState !== 'visible'));
+  document.addEventListener('WeixinJSBridgeReady', () => {
+    try {
+      WeixinJSBridge.on('onPageStateChange', event => setPaused(String(event && event.active || '') === 'false'));
+    } catch (_) {}
+  });
+  retryButtonEl?.addEventListener('click', () => {
+    const keys = Array.from(state.failedFileKeys);
+    keys.forEach(key => {
+      const task = state.tasks.get(key);
+      if (task) {
+        task.status = 'pending';
+        task.error = '';
+        // 重试会重新执行下载/处理阶段，但已展示的任务进度必须作为下限保留。
+        // updateFileProgress 会继续按单调规则推进，避免 96% 回到 0%/75%。
+        const row = filesEl.querySelector(`[data-file-key="${CSS.escape(String(key))}"]`);
+        if (row) row.classList.remove('failed');
+      }
+    });
+    void runTasks(keys).catch(failStartup);
+  });
+  cancelButtonEl?.addEventListener('click', () => { void cancelSession(); });
+
   window.addEventListener('pagehide', () => {
-    void releaseDownloadSlot(true);
-    if (!state.finished && state.sessionToken && state.apiBase) {
-      // 用户手动关闭 WebView 时尽力回收隐藏临时目录。keepalive 只发送小 JSON，
-      // 真正的网盘回收由 Server 接管，不在 pagehide 阶段等待外部 HTTP 完成。
-      void fetch(`${state.apiBase}/api/member/local-build-h5/abort`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionToken: state.sessionToken }),
-        cache: 'no-store',
-        credentials: 'omit',
-        keepalive: true,
-      }).catch(() => {});
-    }
+    // pagehide 可能只是微信把 WebView 暂时放入后台。这里只停止本页资源并释放租约，
+    // 不删除已上传成果；只有用户点击“取消处理”才调用 Server abort。
+    stopSessionHeartbeat();
+    void releaseAllLeases(true);
   });
 
-  start().catch(error => fail(error));
+  window.addEventListener('unload', () => {
+    if (state.fontWorkerBlobUrl) URL.revokeObjectURL(state.fontWorkerBlobUrl);
+  });
+
+  start().catch(error => failStartup(error));
 })();
