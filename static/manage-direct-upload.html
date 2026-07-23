@@ -684,8 +684,34 @@
       return text!=='0'?text:'';
     }
 
+    function normalizeParentFileId(value) {
+      // 新 Server 统一下发字符串；滚动发布期间只兼容旧 Server 的正安全整数。超过
+      // Number.MAX_SAFE_INTEGER 的 JSON number 已在 JSON.parse 时失真，必须拒绝重取。
+      if(typeof value==='number') {
+        if(!Number.isSafeInteger(value) || value<=0) return '';
+        value=String(value);
+      }
+      if(typeof value!=='string') return '';
+      const text=value.trim().replace(/^0+(?=\d)/,'');
+      return /^[1-9]\d*$/.test(text)?text:'';
+    }
+
+    function isParentFileIdRequired(payload) {
+      const code=String(payload?.code ?? '').trim();
+      const message=String(payload?.message || payload?.msg || '').trim();
+      return code==='1' && message==='父级ID必填';
+    }
+
     function uploadOfficial(blob,params,onProgress,uploadAttempt) {
       return new Promise((resolve,reject) => {
+        const parentFileId=normalizeParentFileId(params?.parentFileID);
+        if(!parentFileId) {
+          const error=new Error('服务未返回有效父级ID，正在重新获取上传参数');
+          error.code='PAN123_PARENT_FILE_ID_INVALID';
+          error.retryPrepare=true;
+          reject(error);
+          return;
+        }
         const xhr = new XMLHttpRequest();
         const startedAt=Date.now();
         let attemptFinished=false;
@@ -717,7 +743,11 @@
             catch (_) { payload={}; jsonParseSucceeded=false; }
             if (xhr.status<200 || xhr.status>=300 || ![undefined,null,0,'0',200,'200'].includes(payload.code)) {
               const error=new Error(payload.message || payload.msg || `云端上传失败(${xhr.status})`);
-              error.code=`OFFICIAL_UPLOAD_HTTP_${xhr.status}`;
+              // 已用真实服务账号复现：123pan 对“缺少可解析 parentFileID”返回 HTTP 200、
+              // code=1、message=父级ID必填。该请求不会创建文件，可以安全地重新 prepare
+              // 取当前上传域名并重建一次独立 FormData；其它明确业务错误仍立即失败。
+              error.code=isParentFileIdRequired(payload)?'PAN123_PARENT_FILE_ID_REQUIRED':`OFFICIAL_UPLOAD_HTTP_${xhr.status}`;
+              error.retryPrepare=isParentFileIdRequired(payload);
               error.diagnostic={
                 eventId:createDiagnosticEventId(),stage:'official_upload_response',errorCode:error.code,message:error.message,
                 httpStatus:xhr.status,readyState:xhr.readyState,responseLength:String(xhr.responseText || '').length,
@@ -748,7 +778,7 @@
             settle(()=>resolve({fileId,ambiguous:false,diagnostic:null}));
           };
           const form = new FormData();
-          form.append('parentFileID',String(params.parentFileID));
+          form.append('parentFileID',parentFileId);
           form.append('filename',params.filename);
           form.append('etag',params.etag);
           form.append('size',String(params.size));
@@ -808,6 +838,16 @@
             stage:error?.diagnostic?.stage || 'official_upload',errorCode:error?.code || 'OFFICIAL_UPLOAD_FAILED',message:error?.message,
             uploadAttempt,networkRetryCount:uploadAttempt-1,
           });
+          if(error?.retryPrepare && uploadAttempt<PAN123_UPLOAD_MAX_ATTEMPTS) {
+            const delayMs=retry522Delay(uploadAttempt);
+            updateFileProgress(
+              plan.bridgeId,
+              `云端未识别父级目录，${Math.ceil(delayMs/1000)} 秒后重新获取上传参数（第 ${uploadAttempt+1} 次）`,
+              10
+            );
+            await wait(delayMs);
+            continue;
+          }
           throw error;
         } finally {
           // 无论上传结果是否明确，都尽快释放当前服务账号 AT 字符串引用。
