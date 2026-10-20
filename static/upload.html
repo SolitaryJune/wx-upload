@@ -228,7 +228,7 @@
   <div class="container">
     <div class="upload-area">
       <div class="upload-icon">📁</div>
-      <div class="upload-title">选择本地文件</div>
+      <div class="upload-title">选择设备文件</div>
       <div class="upload-desc">支持选择手机中的任意文件</div>
       <div class="file-input-wrapper">
         <button class="select-btn">选择文件</button>
@@ -254,6 +254,8 @@
     // 静态页只负责把浏览器选择到的文件桥接给小程序，不读取 URL 参数、不判断业务来源、不做直传。
     // 文件类型、数量、大小和后续上传方式统一由小程序前端校验处理，避免强缓存 HTML 和业务规则不同步。
     const CHUNK_SIZE = 2 * 1024 * 1024;
+    let activeTransferId = '';
+    let transferSequence = 0;
 
     document.getElementById('fileInput').addEventListener('change', function(e) {
       const files = Array.from(e.target.files);
@@ -308,9 +310,11 @@
       let failedCount = 0;
       const failedFilesList = [];
       const confirmBtn = document.getElementById('confirmBtn');
+      activeTransferId = createTransferId();
+      transferSequence = 0;
       confirmBtn.disabled = true;
       confirmBtn.textContent = '处理中...';
-      postMiniProgramMessage({ type: 'filesStart', total: totalFiles });
+      postMiniProgramMessage({ type: 'filesStart', total: totalFiles, totalFiles });
 
       for (let i = 0; i < selectedFiles.length; i++) {
         const file = selectedFiles[i];
@@ -322,19 +326,19 @@
           } else {
             const fileData = await readSmallFile(file);
             if (fileData) {
-              postMiniProgramMessage({ type: 'fileData', file: fileData, index: i, total: totalFiles });
+              postMiniProgramMessage({ type: 'fileData', file: fileData, index: i, fileIndex: i, total: totalFiles, totalFiles });
               successCount++;
             } else { failedCount++; failedFilesList.push(file.name); }
           }
           await delay(50);
         } catch (error) {
-          console.error('处理文件失败:', error instanceof Error ? error.name : 'UnknownError');
+          console.error(`处理文件失败 [${file.name}]:`, error);
           failedCount++;
           failedFilesList.push(file.name);
         }
       }
 
-      postMiniProgramMessage({ type: 'filesEnd', successCount, failedCount, failedFiles: failedFilesList });
+      postMiniProgramMessage({ type: 'filesEnd', total: totalFiles, totalFiles, successCount, failedCount, failedFiles: failedFilesList });
       confirmBtn.textContent = '传输完成，正在返回...';
       confirmBtn.disabled = true;
       await delay(300);
@@ -356,21 +360,32 @@
 
         try {
           const chunkData = await readBlobAsBase64(chunk);
-          postMiniProgramMessage({ type: 'chunkData', fileId, chunkIndex, totalChunks, data: chunkData });
+          postMiniProgramMessage({ type: 'chunkData', fileId, chunkIndex, totalChunks, fileIndex, totalFiles, data: chunkData });
           await delay(30);
         } catch (error) {
-          console.error(`分片 ${chunkIndex} 失败:`, error instanceof Error ? error.name : 'UnknownError');
-          postMiniProgramMessage({ type: 'chunkError', fileId, error: error.message });
+          console.error(`分片 ${chunkIndex} 失败:`, error);
+          postMiniProgramMessage({ type: 'chunkError', fileId, fileName: file.name, fileIndex, totalFiles, error: error.message });
           return false;
         }
       }
 
-      postMiniProgramMessage({ type: 'chunkEnd', fileId });
+      postMiniProgramMessage({ type: 'chunkEnd', fileId, fileName: file.name, fileIndex, totalFiles, totalChunks });
       return true;
     }
 
     function postMiniProgramMessage(data) {
-      wx.miniProgram.postMessage({ data });
+      wx.miniProgram.postMessage({
+        data: {
+          ...data,
+          transferId: activeTransferId,
+          sequence: transferSequence++,
+          sentAt: Date.now()
+        }
+      });
+    }
+
+    function createTransferId() {
+      return `webview_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
     }
 
     function navigateBackToMiniProgram(confirmBtn) {
