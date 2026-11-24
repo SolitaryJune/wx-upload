@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>支付链接跳转</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; font: 15px/1.7 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif; background: #f5f6f8; color: #1f2329; }
+  h1 { font-size: 17px; margin: 0 0 12px; }
+  .card { background: #fff; border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+  .label { color: #8a9099; font-size: 12px; }
+  .val { word-break: break-all; font-family: ui-monospace,Menlo,Consolas,monospace; font-size: 12px; }
+  button { width: 100%; border: 0; border-radius: 8px; padding: 12px; font-size: 15px; margin-top: 10px; background: #07c160; color: #fff; }
+  button.secondary { background: #e8eaed; color: #1f2329; }
+  pre { white-space: pre-wrap; word-break: break-all; font-size: 13px; background: #0f1419; color: #c9d1d9; border-radius: 8px; padding: 12px; min-height: 60px; margin: 0; }
+  .warn { color: #c0392b; font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>支付链接跳转（测试）</h1>
+
+<div class="card">
+  <div class="label">链接</div>
+  <div class="val" id="link">（空）</div>
+  <div class="warn" id="hint"></div>
+</div>
+
+<div class="card">
+  <button id="btnOpen">立即跳转</button>
+  <button id="btnCopy" class="secondary">复制链接</button>
+</div>
+
+<div class="card">
+  <div class="label">结果</div>
+  <pre id="result">等待操作…</pre>
+</div>
+
+<script>
+(function () {
+  var linkEl = document.getElementById('link');
+  var hintEl = document.getElementById('hint');
+  var resultEl = document.getElementById('result');
+
+  var query = {};
+  location.search.replace(/^\?/, '').split('&').forEach(function (pair) {
+    if (!pair) return;
+    var idx = pair.indexOf('=');
+    var k = idx >= 0 ? pair.slice(0, idx) : pair;
+    var v = idx >= 0 ? pair.slice(idx + 1) : '';
+    try { query[decodeURIComponent(k)] = decodeURIComponent(v); } catch (e) { query[k] = v; }
+  });
+
+  var link = String(query.u || '').trim();
+  linkEl.textContent = link || '（空）';
+
+  // 只允许微信支付 Native 码和微信 H5 支付链接，避免变成任意 scheme 的跳板。
+  var allowed = /^weixin:\/\/wxpay\//i.test(link) || /^https:\/\/wx\.tenpay\.com\//i.test(link);
+  var isMiniProgram = /miniProgram/i.test(navigator.userAgent || '') || window.__wxjs_environment === 'miniprogram';
+
+  if (!link) {
+    hintEl.textContent = 'URL 缺少 u 参数。';
+  } else if (!allowed) {
+    hintEl.textContent = '只支持 weixin://wxpay/... 或 https://wx.tenpay.com/... 链接。';
+  } else if (isMiniProgram) {
+    hintEl.textContent = '当前在小程序 web-view 内：微信会拦截 weixin:// 跳转，下面的「立即跳转」大概率无效。请保存二维码用「扫一扫 → 相册」识别，或把链接复制到系统浏览器打开。';
+  }
+
+  function log(line) {
+    resultEl.textContent += (resultEl.textContent === '等待操作…' ? '' : '\n') + line;
+  }
+
+  function openLink() {
+    if (!link || !allowed) {
+      log('链接为空或不受支持');
+      return;
+    }
+    resultEl.textContent = '正在跳转…';
+    try {
+      // 顶层跳转；微信内会被拦截，系统浏览器可能唤起微信。
+      window.location.href = link;
+      log('已执行 location.href = ' + link);
+    } catch (e) {
+      log('跳转异常: ' + (e && e.message ? e.message : e));
+    }
+    setTimeout(function () {
+      if (document.visibilityState === 'visible') {
+        log('1.5 秒后页面仍可见：跳转可能被拦截。请复制链接到系统浏览器，或用「扫一扫 → 相册」识别二维码。');
+      }
+    }, 1500);
+  }
+
+  document.getElementById('btnOpen').addEventListener('click', openLink);
+
+  document.getElementById('btnCopy').addEventListener('click', function () {
+    if (!link) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(link).then(function () {
+        log('已复制到剪贴板');
+      }).catch(function () {
+        log('复制失败，请长按链接手动复制');
+      });
+    } else {
+      var ta = document.createElement('textarea');
+      ta.value = link;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); log('已复制到剪贴板'); } catch (e) { log('复制失败，请长按链接手动复制'); }
+      document.body.removeChild(ta);
+    }
+  });
+})();
+</script>
+</body>
+</html>
