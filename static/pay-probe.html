@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>H5 支付探测</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; font: 14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif; background: #f5f6f8; color: #1f2329; }
+  h1 { font-size: 17px; margin: 0 0 12px; }
+  .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  .label { color: #8a9099; font-size: 12px; }
+  .val { word-break: break-all; font-family: ui-monospace,Menlo,Consolas,monospace; font-size: 12px; }
+  button { width: 100%; border: 0; border-radius: 8px; padding: 12px; font-size: 15px; margin-top: 8px; background: #07c160; color: #fff; }
+  button.secondary { background: #e8eaed; color: #1f2329; }
+  button:disabled { opacity: .5; }
+  pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; background: #0f1419; color: #c9d1d9; border-radius: 8px; padding: 12px; min-height: 80px; margin: 0; }
+  .warn { color: #c0392b; font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>H5 支付探测（微信内 / 小程序 web-view）</h1>
+
+<div class="card">
+  <div class="label">运行环境</div>
+  <div class="val" id="env">检测中…</div>
+</div>
+
+<div class="card">
+  <div class="label">支付参数（已脱敏）</div>
+  <div class="val" id="params">—</div>
+  <div class="warn" id="parseWarn"></div>
+</div>
+
+<div class="card">
+  <button id="btnWithAppId">拉起支付（带 appId）</button>
+  <button id="btnNoAppId" class="secondary">拉起支付（不带 appId）</button>
+</div>
+
+<div class="card">
+  <div class="label">结果</div>
+  <pre id="result">等待操作…</pre>
+</div>
+
+<script>
+(function () {
+  var resultEl = document.getElementById('result');
+  var envEl = document.getElementById('env');
+  var paramsEl = document.getElementById('params');
+  var parseWarnEl = document.getElementById('parseWarn');
+  var bridgeReady = false;
+
+  function log(line) {
+    resultEl.textContent += (resultEl.textContent === '等待操作…' ? '' : '\n') + line;
+  }
+
+  function setResult(text) {
+    resultEl.textContent = text;
+  }
+
+  // URL: ?p=<encodeURIComponent(JSON)>&appId=wx...
+  var query = {};
+  location.search.replace(/^\?/, '').split('&').forEach(function (pair) {
+    if (!pair) return;
+    var idx = pair.indexOf('=');
+    var k = idx >= 0 ? pair.slice(0, idx) : pair;
+    var v = idx >= 0 ? pair.slice(idx + 1) : '';
+    try { query[decodeURIComponent(k)] = decodeURIComponent(v); } catch (e) { query[k] = v; }
+  });
+
+  var appId = query.appId || '';
+  var params = {};
+  if (query.p) {
+    try {
+      params = JSON.parse(query.p);
+    } catch (e) {
+      parseWarnEl.textContent = '参数解析失败：' + (e && e.message ? e.message : e);
+    }
+  } else {
+    parseWarnEl.textContent = 'URL 缺少 p 参数，无法测试。';
+  }
+
+  // 归一化字段
+  var payParams = {
+    timeStamp: params.timeStamp || params.timestamp || '',
+    nonceStr: params.nonceStr || params.nonce_str || '',
+    'package': params['package'] || '',
+    signType: params.signType || params.sign_type || 'MD5',
+    paySign: params.paySign || params.pay_sign || ''
+  };
+
+  var missing = [];
+  if (!payParams.timeStamp) missing.push('timeStamp');
+  if (!payParams.nonceStr) missing.push('nonceStr');
+  if (!payParams['package']) missing.push('package');
+  if (!payParams.paySign) missing.push('paySign');
+  if (missing.length) {
+    parseWarnEl.textContent = (parseWarnEl.textContent ? parseWarnEl.textContent + '；' : '') + '缺少字段：' + missing.join(', ');
+  }
+
+  paramsEl.textContent =
+    'appId: ' + (appId || '（空）') + '\n' +
+    'timeStamp: ' + (payParams.timeStamp || '（空）') + '\n' +
+    'nonceStr: ' + (payParams.nonceStr || '（空）') + '\n' +
+    'package: ' + (payParams['package'] || '（空）') + '\n' +
+    'signType: ' + payParams.signType + '\n' +
+    'paySign: ' + (payParams.paySign ? payParams.paySign.slice(0, 10) + '…（已截断）' : '（空）');
+
+  var ua = navigator.userAgent || '';
+  envEl.textContent =
+    'UA: ' + ua + '\n' +
+    '__wxjs_environment: ' + (window.__wxjs_environment || '（未设置）') + '\n' +
+    'WeixinJSBridge: ' + (typeof window.WeixinJSBridge === 'undefined' ? '未注入' : '已注入');
+
+  function invokePay(useAppId) {
+    var payload = {
+      timeStamp: payParams.timeStamp,
+      nonceStr: payParams.nonceStr,
+      'package': payParams['package'],
+      signType: payParams.signType,
+      paySign: payParams.paySign
+    };
+    if (useAppId) payload.appId = appId;
+
+    setResult('调用中…（' + (useAppId ? '带 appId' : '不带 appId') + '）');
+    try {
+      window.WeixinJSBridge.invoke('getBrandWCPayRequest', payload, function (res) {
+        var errMsg = res && res.err_msg ? res.err_msg : JSON.stringify(res);
+        log('回调: ' + errMsg);
+        if (errMsg && errMsg.indexOf(':ok') > -1) {
+          log('结论: 支付拉起成功（get_brand_wcpay_request:ok）');
+        } else if (errMsg && errMsg.indexOf(':cancel') > -1) {
+          log('结论: 已拉起，用户取消（:cancel）——说明支付通道可用');
+        } else {
+          log('结论: 拉起失败');
+        }
+      });
+      log('已调用 getBrandWCPayRequest');
+    } catch (e) {
+      log('调用异常: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  document.getElementById('btnWithAppId').addEventListener('click', function () {
+    if (!window.WeixinJSBridge) { log('WeixinJSBridge 未注入，无法调用'); return; }
+    invokePay(true);
+  });
+  document.getElementById('btnNoAppId').addEventListener('click', function () {
+    if (!window.WeixinJSBridge) { log('WeixinJSBridge 未注入，无法调用'); return; }
+    invokePay(false);
+  });
+
+  // WeixinJSBridge 可能延迟注入
+  if (!window.WeixinJSBridge) {
+    document.addEventListener('WeixinJSBridgeReady', function () {
+      bridgeReady = true;
+      envEl.textContent += '\nWeixinJSBridge: WeixinJSBridgeReady 后已注入';
+    }, false);
+  }
+})();
+</script>
+</body>
+</html>
